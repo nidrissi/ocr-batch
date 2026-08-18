@@ -1,0 +1,17 @@
+[project]
+name = "ocr-batch"
+version = "0.1.0a1"
+description = "Batch OCR PDF using PyMuPDF and the Mistral API."
+readme = "README.md"
+authors = [
+    { name = "Najib Idrissi-Kaïtouni", email = "najib.idrissi.kaitouni@outlook.com" },
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+ocr-batch = "ocr_batch:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
