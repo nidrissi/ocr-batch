@@ -1,13 +1,13 @@
 [project]
 name = "ocr-batch"
-version = "0.1.0a1"
+version = "0.1.0b1"
 description = "Batch OCR PDF using PyMuPDF and the Mistral API."
 readme = "README.md"
 authors = [
     { name = "Najib Idrissi-Kaïtouni", email = "najib.idrissi.kaitouni@outlook.com" },
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["mistralai>=2.9,<3", "pymupdf>=1.28"]
 
 [project.scripts]
 ocr-batch = "ocr_batch:main"
@@ -15,3 +15,27 @@ ocr-batch = "ocr_batch:main"
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8", "pyright>=1.1.400", "ruff>=0.9"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Broad excepts are deliberate around the SDK and the extraction workers.
+"src/ocr_batch/remote.py" = ["BLE001"]
+"src/ocr_batch/native.py" = ["BLE001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
