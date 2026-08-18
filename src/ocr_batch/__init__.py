@@ -1,13 +1,12 @@
+import hashlib
 import json
 import os
 import time
-import hashlib
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pymupdf
 from mistralai.client import Mistral
-
 
 MODEL = "mistral-ocr-4-0"
 
@@ -17,15 +16,16 @@ MODEL = "mistral-ocr-4-0"
 # --------------------------------------------------------------------
 
 
-def pymupdf_extract(pdf_path: str, output_path: str):
-    pdf_path = Path(pdf_path)
-    output_path = Path(output_path)
+def pymupdf_extract(pdf_path_name: str, output_path_name: str):
+    pdf_path = Path(pdf_path_name)
+    output_path = Path(output_path_name)
 
     pages = []
 
     with pymupdf.open(pdf_path) as doc:
-        for i, page in enumerate(doc):
-            text = page.get_text("text", sort=True).strip()
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            text = page.get_text("text", sort=True).strip()  # pyright: ignore[reportAttributeAccessIssue]
 
             pages.append(f"===== PAGE {i + 1} =====\n\n{text}")
 
@@ -199,6 +199,9 @@ def run(input_dir: Path, output_dir: Path):
     # --------------------------------------------------------------
     # F. Download Mistral's JSONL batch result
     # --------------------------------------------------------------
+
+    if not status.output_file:
+        raise RuntimeError("Batch ended with no output file")
 
     result_stream = client.files.download(file_id=status.output_file)
 
