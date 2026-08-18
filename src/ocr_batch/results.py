@@ -115,7 +115,12 @@ def split_results(
 
             paths = output_paths(state.output_dir, Path(document.relative_path))
 
-            if document.ocr_written and paths.ocr_md.exists() and not force:
+            if (
+                document.ocr_written
+                and paths.ocr_md.exists()
+                and paths.ocr_json.exists()
+                and not force
+            ):
                 summary.skipped += 1
                 continue
 

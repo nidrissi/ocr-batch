@@ -4,7 +4,7 @@ import pytest
 from conftest import Corpus, FakeMistral, batch_line
 
 from ocr_batch import cli
-from ocr_batch.errors import CollisionError, ConfigError, StateError
+from ocr_batch.errors import CollisionError, ConfigError, RemoteError, StateError
 from ocr_batch.state import RunState
 
 
@@ -121,6 +121,21 @@ def test_completed_documents_are_skipped_unless_forced(
     assert (out / "a.native.txt").exists()
 
 
+def test_missing_ocr_json_is_not_treated_as_complete(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    submitted = cli.do_submit(corpus.root, out, options())
+    patched_client.downloads["out-1"] = results_for(submitted)
+    cli.do_fetch(out)
+    (out / "a.ocr.json").unlink()
+
+    state = cli.do_submit(corpus.root, out, options())
+
+    assert state.jobs
+    assert len(patched_client.submitted) == 5
+
+
 def test_a_failure_before_any_job_exists_deletes_the_uploads(
     corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
 ):
@@ -161,13 +176,84 @@ def test_cleanup_waits_for_a_running_job_unless_forced(
     patched_client.job_status = "RUNNING"
     cli.do_submit(corpus.root, out, options())
 
-    cli.do_cleanup(out)
+    assert cli.do_cleanup(out) == cli.EXIT_ERROR
 
     assert patched_client.deleted == []
 
-    cli.do_cleanup(out, force=True)
+    assert cli.do_cleanup(out, force=True) == cli.EXIT_OK
 
     assert len(patched_client.deleted) == 4
+
+
+def test_cleanup_failure_is_an_error_and_remains_retryable(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    cli.do_submit(corpus.root, out, options())
+    patched_client.fail_delete_for = {"file-1"}
+
+    assert cli.do_cleanup(out) == cli.EXIT_ERROR
+    assert [remote.file_id for remote in RunState.load(out).pending_remote_files()] == ["file-1"]
+
+
+def test_fetch_download_failure_still_cleans_up(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    cli.do_submit(corpus.root, out, options())
+
+    with pytest.raises(RemoteError, match="could not download"):
+        cli.do_fetch(out)
+
+    assert len(patched_client.deleted) == 4
+    assert RunState.load(out).pending_remote_files() == []
+
+
+def test_fetch_download_failure_honors_keep_remote(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    cli.do_submit(corpus.root, out, options())
+
+    with pytest.raises(RemoteError, match="could not download"):
+        cli.do_fetch(out, keep_remote=True)
+
+    assert patched_client.deleted == []
+    assert len(RunState.load(out).pending_remote_files()) == 4
+
+
+def test_fetch_split_failure_still_cleans_up(
+    corpus: Corpus,
+    tmp_path: Path,
+    patched_client: FakeMistral,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    out = tmp_path / "out"
+    submitted = cli.do_submit(corpus.root, out, options())
+    patched_client.downloads["out-1"] = results_for(submitted)
+
+    def fail_split(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("split boom")
+
+    monkeypatch.setattr(cli, "split_results", fail_split)
+
+    with pytest.raises(RuntimeError, match="split boom"):
+        cli.do_fetch(out)
+
+    assert len(patched_client.deleted) == 4
+    assert RunState.load(out).pending_remote_files() == []
+
+
+def test_fetch_cleanup_failure_is_an_error(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    submitted = cli.do_submit(corpus.root, out, options())
+    patched_client.downloads["out-1"] = results_for(submitted)
+    patched_client.fail_delete_for = {"file-1"}
+
+    assert cli.do_fetch(out) == cli.EXIT_ERROR
+    assert [remote.file_id for remote in RunState.load(out).pending_remote_files()] == ["file-1"]
 
 
 def test_fetch_without_wait_reports_a_running_job(
@@ -272,3 +358,19 @@ def test_a_missing_api_key_fails_before_any_work(
         cli.do_submit(corpus.root, out, options())
 
     assert not (out / "_state.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("jobs", 0),
+        ("upload_workers", -1),
+        ("batch_size", 0),
+        ("timeout_hours", -1),
+        ("url_expiry_hours", 0),
+        ("upload_expiry_hours", -1),
+    ],
+)
+def test_submit_options_reject_non_positive_numbers(field: str, value: int):
+    with pytest.raises(ConfigError, match=field.replace("_", "-")):
+        options(**{field: value})

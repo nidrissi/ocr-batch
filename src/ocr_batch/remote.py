@@ -7,7 +7,7 @@ module can be driven by a fake in tests.
 import logging
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -160,8 +160,9 @@ def upload_documents(
     can persist state without locking.
     """
     uploads: list[Upload] = []
+    failure: BaseException | None = None
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
                 upload_document,
@@ -174,25 +175,47 @@ def upload_documents(
             for custom_id, path in items
         }
 
-        try:
-            for done, future in enumerate(as_completed(futures), 1):
-                try:
-                    upload = future.result()
-                except UploadError as exc:
-                    if exc.file_id is not None:
-                        on_orphan(exc.file_id)
+        def record_failure(exc: BaseException) -> None:
+            nonlocal failure
 
-                    raise
+            if failure is not None:
+                return
 
-                uploads.append(upload)
-                on_upload(upload)
+            failure = exc
 
-                log.info("uploaded %d/%d", done, len(futures))
-        except BaseException:
             for future in futures:
                 future.cancel()
 
-            raise
+        for done, future in enumerate(as_completed(futures), 1):
+            try:
+                upload = future.result()
+            except CancelledError:
+                continue
+            except UploadError as exc:
+                record_failure(exc)
+
+                if exc.file_id is not None:
+                    try:
+                        on_orphan(exc.file_id)
+                    except BaseException as callback_exc:
+                        record_failure(callback_exc)
+
+                continue
+            except BaseException as exc:
+                record_failure(exc)
+                continue
+
+            uploads.append(upload)
+
+            try:
+                on_upload(upload)
+            except BaseException as exc:
+                record_failure(exc)
+
+            log.info("uploaded %d/%d", done, len(futures))
+
+    if failure is not None:
+        raise failure
 
     return uploads
 
@@ -240,8 +263,8 @@ def submit_jobs(
     """
     job_ids: list[str] = []
 
-    for start in range(0, len(requests), max(1, batch_size)):
-        chunk = list(requests[start : start + max(1, batch_size)])
+    for start in range(0, len(requests), batch_size):
+        chunk = list(requests[start : start + batch_size])
 
         try:
             job = client.batch.jobs.create(

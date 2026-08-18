@@ -1,3 +1,5 @@
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,7 @@ from ocr_batch.errors import UploadError
 from ocr_batch.remote import (
     MAX_URL_EXPIRY_HOURS,
     OcrOptions,
+    Upload,
     build_request,
     delete_files,
     download_file,
@@ -63,6 +66,43 @@ def test_a_failed_signed_url_still_reports_the_stored_file(
         )
 
     assert orphans == ["file-1"]
+
+
+def test_upload_failure_still_reports_sibling_uploads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_client: FakeMistral
+):
+    barrier = threading.Barrier(3)
+    created: list[str] = []
+
+    def controlled_upload(client: object, *, custom_id: str, **kwargs: object) -> Upload:
+        barrier.wait()
+
+        if custom_id == "bad":
+            raise UploadError("signed URL failed", file_id="file-bad")
+
+        time.sleep(0.05)
+        file_id = f"file-{custom_id}"
+        created.append(file_id)
+        return Upload(custom_id, file_id, f"https://example.invalid/{file_id}")
+
+    monkeypatch.setattr("ocr_batch.remote.upload_document", controlled_upload)
+    recorded: list[str] = []
+    orphans: list[str] = []
+
+    with pytest.raises(UploadError, match="signed URL failed"):
+        upload_documents(
+            fake_client,
+            [(name, tmp_path / f"{name}.pdf") for name in ("bad", "a", "b")],
+            workers=3,
+            url_expiry_hours=24,
+            upload_expiry_hours=48,
+            on_upload=lambda upload: recorded.append(upload.file_id),
+            on_orphan=orphans.append,
+        )
+
+    assert sorted(created) == ["file-a", "file-b"]
+    assert sorted(recorded) == ["file-a", "file-b"]
+    assert orphans == ["file-bad"]
 
 
 def test_requests_are_chunked_into_several_jobs(fake_client: FakeMistral):

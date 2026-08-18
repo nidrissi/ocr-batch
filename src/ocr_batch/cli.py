@@ -69,6 +69,20 @@ class SubmitOptions:
     label: str = "ocr-batch"
     ocr_options: OcrOptions = field(default_factory=OcrOptions)
 
+    def __post_init__(self) -> None:
+        values = {
+            "jobs": self.jobs,
+            "upload-workers": self.upload_workers,
+            "batch-size": self.batch_size,
+            "timeout-hours": self.timeout_hours,
+            "url-expiry-hours": self.url_expiry_hours,
+            "upload-expiry-hours": self.upload_expiry_hours,
+        }
+
+        for name, value in values.items():
+            if value is not None and value <= 0:
+                raise ConfigError(f"--{name} must be positive")
+
     @property
     def effective_upload_expiry_hours(self) -> int:
         """Server-side expiry for uploads, comfortably outliving the job itself."""
@@ -278,7 +292,7 @@ def do_submit(
         if opts.native and (opts.force or not paths.native.exists()):
             native_targets.append((custom_id, source, paths.native))
 
-        if opts.ocr and (opts.force or not paths.ocr_md.exists()):
+        if opts.ocr and (opts.force or not paths.ocr_md.exists() or not paths.ocr_json.exists()):
             ocr_targets.append((custom_id, source))
 
     if not native_targets and not ocr_targets:
@@ -352,12 +366,12 @@ def _record_jobs(state: RunState, jobs: dict[str, Any]) -> None:
     state.save()
 
 
-def cleanup_remote(client: MistralClient, state: RunState, *, force: bool = False) -> None:
+def cleanup_remote(client: MistralClient, state: RunState, *, force: bool = False) -> bool:
     """Delete uploaded originals once no job needs them any more."""
     pending = state.pending_remote_files()
 
     if not pending:
-        return
+        return True
 
     if not force and state.active_jobs():
         log.warning(
@@ -365,7 +379,7 @@ def cleanup_remote(client: MistralClient, state: RunState, *, force: bool = Fals
             len(pending),
             ", ".join(job.job_id for job in state.active_jobs()),
         )
-        return
+        return False
 
     failures = delete_files(client, [remote.file_id for remote in pending])
 
@@ -381,6 +395,8 @@ def cleanup_remote(client: MistralClient, state: RunState, *, force: bool = Fals
         log.warning("re-run `ocr-batch cleanup %s` to retry", state.output_dir)
     else:
         log.info("deleted %d uploaded file(s) from Mistral", len(pending))
+
+    return not failures
 
 
 def do_fetch(
@@ -437,33 +453,44 @@ def do_fetch(
 
         summary = SplitSummary()
 
-        for job in state.jobs:
-            if job.error_file:
-                path = download_file(client, job.error_file, state.errors_path(job.job_id))
-                log.warning("per-request errors written to %s", path)
+        try:
+            for job in state.jobs:
+                if job.error_file:
+                    path = download_file(client, job.error_file, state.errors_path(job.job_id))
+                    log.warning("per-request errors written to %s", path)
 
-            if not job.output_file:
-                log.error("job %s [%s] produced no output file", job.job_id, job.status)
-                continue
+                if not job.output_file:
+                    log.error("job %s [%s] produced no output file", job.job_id, job.status)
+                    continue
 
-            results = download_file(client, job.output_file, state.results_path(job.job_id))
-            part = split_results(results, state, force=force)
+                results = download_file(client, job.output_file, state.results_path(job.job_id))
+                part = split_results(results, state, force=force)
 
-            summary.written += part.written
-            summary.failed += part.failed
-            summary.skipped += part.skipped
-            summary.unknown += part.unknown
-            summary.malformed += part.malformed
+                summary.written += part.written
+                summary.failed += part.failed
+                summary.skipped += part.skipped
+                summary.unknown += part.unknown
+                summary.malformed += part.malformed
 
-            job.fetched = True
+                job.fetched = True
 
-        state.save()
-        state.write_manifest()
+            state.save()
+            state.write_manifest()
 
-        log.info("OCR results: %s", summary)
+            log.info("OCR results: %s", summary)
+        except BaseException:
+            if not keep_remote:
+                try:
+                    cleanup_remote(client, state)
+                except BaseException as cleanup_exc:
+                    log.warning("cleanup after fetch failure also failed: %s", cleanup_exc)
 
-        if not keep_remote:
-            cleanup_remote(client, state)
+            raise
+
+        cleanup_ok = keep_remote or cleanup_remote(client, state)
+
+    if not cleanup_ok:
+        return EXIT_ERROR
 
     failed_jobs = [job for job in state.jobs if job.status != "SUCCESS"]
 
@@ -542,9 +569,9 @@ def do_cleanup(output_dir: Path, *, force: bool = False, api_key: str | None = N
         if state.jobs and not force:
             _record_jobs(state, refresh_jobs(client, [job.job_id for job in state.jobs]))
 
-        cleanup_remote(client, state, force=force)
+        cleaned = cleanup_remote(client, state, force=force)
 
-    return EXIT_OK
+    return EXIT_OK if cleaned else EXIT_ERROR
 
 
 def _submit_exit_code(state: RunState) -> int:

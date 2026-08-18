@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
 
+import pytest
 from conftest import batch_line
 
+from ocr_batch.paths import output_paths
 from ocr_batch.results import render_markdown, split_results
 from ocr_batch.state import DocumentState, RunState
 
@@ -75,6 +77,23 @@ def test_split_is_idempotent_and_forceable(tmp_path: Path):
     assert split_results(results, state).written == 1
     assert split_results(results, state).skipped == 1
     assert split_results(results, state, force=True).written == 1
+
+
+@pytest.mark.parametrize("missing", ["ocr_md", "ocr_json"])
+def test_split_restores_either_missing_output(tmp_path: Path, missing: str):
+    state = make_state(tmp_path, ("id1", "a.pdf"))
+    results = tmp_path / "r.jsonl"
+    results.write_text(batch_line("id1") + "\n", encoding="utf-8")
+    paths = output_paths(tmp_path, Path("a.pdf"))
+
+    split_results(results, state)
+    getattr(paths, missing).unlink()
+
+    summary = split_results(results, state)
+
+    assert summary.written == 1
+    assert paths.ocr_md.exists()
+    assert paths.ocr_json.exists()
 
 
 def test_error_detail_is_recorded(tmp_path: Path):

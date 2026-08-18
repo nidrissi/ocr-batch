@@ -28,8 +28,8 @@ $ ocr-batch run ./applications ./ocr-output
 `run` is the whole pipeline: it starts local extraction, uploads the PDFs,
 creates the batch job(s), waits for them, downloads and splits the results, and
 deletes the uploaded originals. The individual stages are also available, and
-every one of them is resumable, because the run's full state is on disk in
-`<output_dir>/_state.json` before it is acted on:
+submitted jobs are resumable because their ids and uploaded file ids are kept in
+`<output_dir>/_state.json` as they arrive:
 
 | Command | What it does |
 | --- | --- |
@@ -40,9 +40,9 @@ every one of them is resumable, because the run's full state is on disk in
 | `ocr-batch run IN OUT` | `submit` + `fetch`. |
 
 If a `run` is interrupted, the job keeps going on Mistral's side; pick it back up
-with `ocr-batch fetch OUT`. Nothing is ever uploaded or submitted twice: `submit`
+with `ocr-batch fetch OUT`. Recorded live jobs are not submitted twice: `submit`
 refuses to start while a job from a previous run is still live, and skips
-documents whose outputs already exist (`--force` overrides both).
+documents whose complete outputs already exist (`--force` overrides both).
 
 ### Output layout
 
@@ -83,9 +83,9 @@ Exit codes: `0` success, `1` error, `3` finished with per-document failures,
 ## Data handling
 
 The PDFs are uploaded to Mistral (`purpose: ocr`, `visibility: user`) and made
-readable to the batch job through a signed URL valid for up to 168 hours. They
-are deleted as soon as the results have been fetched, including after a failed
-or timed-out job; `ocr-batch cleanup` re-runs the deletion if any of it failed.
+readable to the batch job through a signed URL valid for up to 168 hours. Once a
+job is terminal, the CLI attempts deletion even if fetching or splitting its
+results fails; `ocr-batch cleanup` re-runs any deletion that failed.
 As a backstop for a crash between an upload and its id reaching disk, uploads
 also carry a server-side expiry (job timeout + 24h by default).
 
