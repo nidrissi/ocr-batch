@@ -14,15 +14,31 @@ be diffed line by line.
 
 Requires Python 3.14+.
 
-```console
-$ uv sync
-$ export MISTRAL_API_KEY=...        # or pass --api-key
+With [uv](https://docs.astral.sh/uv/), no checkout needed:
+
+```bash
+uvx --from git+https://github.com/nidrissi/ocr-batch ocr-batch run ./applications ./ocr-output
+```
+
+Or from a clone:
+
+```bash
+git clone https://github.com/nidrissi/ocr-batch
+cd ocr-batch
+uv sync
+uv run ocr-batch run ./applications ./ocr-output
+```
+
+Export your Mistral API key before running either command (or pass `--api-key`):
+
+```bash
+export MISTRAL_API_KEY=...
 ```
 
 ## Usage
 
-```console
-$ ocr-batch run ./applications ./ocr-output
+```bash
+ocr-batch run ./applications ./ocr-output
 ```
 
 `run` is the whole pipeline: it starts local extraction, uploads the PDFs,
