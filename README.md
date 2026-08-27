@@ -17,7 +17,7 @@ Requires Python 3.14+.
 With [uv](https://docs.astral.sh/uv/), no checkout needed:
 
 ```bash
-uvx --from git+https://github.com/nidrissi/ocr-batch ocr-batch run ./applications ./ocr-output
+uvx ocr-batch run ./applications ./ocr-output
 ```
 
 Or from a clone:
