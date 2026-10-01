@@ -42,7 +42,7 @@ from .state import DocumentState, JobState, RemoteFile, RunState
 
 log = logging.getLogger("ocr_batch")
 
-DEFAULT_MODEL = "mistral-ocr-4-0"
+DEFAULT_MODEL = "mistral-ocr-4-1"
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_UPLOAD_WORKERS = 8
 DEFAULT_TIMEOUT_HOURS = 24
@@ -147,11 +147,17 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
 
     previous = RunState.load_if_exists(output_dir)
 
-    if previous is not None and previous.active_jobs() and not opts.force:
+    if previous is not None and previous.active_jobs():
         active = ", ".join(job.job_id for job in previous.active_jobs())
         raise StateError(
             f"{output_dir} already has running batch job(s): {active}. "
-            "Use `ocr-batch status` / `ocr-batch fetch`, or --force to start over."
+            "Use `ocr-batch status` / `ocr-batch fetch` before submitting again."
+        )
+
+    if previous is not None and any(not job.fetched for job in previous.jobs):
+        raise StateError(
+            f"{output_dir} has unfetched batch job(s). "
+            "Use `ocr-batch fetch` before submitting again."
         )
 
     state = RunState.create(output_dir=output_dir, input_dir=input_dir, model=opts.model)
@@ -174,9 +180,12 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
         old = previous.documents.get(custom_id) if previous is not None else None
 
         if old is not None and old.sha256 == document.sha256:
-            document.native_pages = old.native_pages
-            document.native_error = old.native_error
-            document.ocr_written = old.ocr_written
+            if not (opts.force and opts.native):
+                document.native_pages = old.native_pages
+                document.native_error = old.native_error
+            if not (opts.force and opts.ocr):
+                document.ocr_written = old.ocr_written
+                document.ocr_error = old.ocr_error
 
         state.documents[custom_id] = document
 
@@ -289,11 +298,26 @@ def do_submit(
         source = input_dir / rel
         paths = output_paths(output_dir, rel)
 
-        if opts.native and (opts.force or not paths.native.exists()):
+        if opts.native and (
+            opts.force
+            or document.native_pages is None
+            or document.native_error
+            or not paths.native.is_file()
+        ):
             native_targets.append((custom_id, source, paths.native))
 
-        if opts.ocr and (opts.force or not paths.ocr_md.exists() or not paths.ocr_json.exists()):
+        if opts.ocr and (
+            opts.force
+            or not document.ocr_written
+            or document.ocr_error
+            or not paths.ocr_md.is_file()
+            or not paths.ocr_json.is_file()
+        ):
+            document.ocr_written = False
+            document.ocr_error = None
             ocr_targets.append((custom_id, source))
+
+    state.save()
 
     if not native_targets and not ocr_targets:
         log.info("nothing to do: every output already exists (use --force to redo)")
@@ -362,6 +386,7 @@ def _record_jobs(state: RunState, jobs: dict[str, Any]) -> None:
         job.status = str(remote_job.status)
         job.output_file = getattr(remote_job, "output_file", None)
         job.error_file = getattr(remote_job, "error_file", None)
+        job.failed_requests = getattr(remote_job, "failed_requests", 0) or 0
 
     state.save()
 
@@ -414,7 +439,7 @@ def do_fetch(
     if not state.jobs:
         raise StateError(f"no batch jobs recorded in {output_dir}")
 
-    job_ids = [job.job_id for job in state.jobs]
+    job_ids = [job.job_id for job in state.jobs if not (job.terminal and job.fetched)]
 
     with make_client(api_key) as client:
 
@@ -423,7 +448,9 @@ def do_fetch(
             log.info("mistral: %s", _describe(jobs, progress))
 
         try:
-            if wait:
+            if not job_ids:
+                jobs = {}
+            elif wait:
                 jobs = wait_for_jobs(client, job_ids, on_update=on_update)
             else:
                 jobs = refresh_jobs(client, job_ids)
@@ -455,26 +482,51 @@ def do_fetch(
 
         try:
             for job in state.jobs:
+                parts: list[SplitSummary] = []
                 if job.error_file:
-                    path = download_file(client, job.error_file, state.errors_path(job.job_id))
+                    path = state.errors_path(job.job_id)
+                    if not (job.fetched and path.is_file()):
+                        download_file(client, job.error_file, path)
                     log.warning("per-request errors written to %s", path)
+                    parts.append(split_results(path, state))
 
                 if not job.output_file:
                     log.error("job %s [%s] produced no output file", job.job_id, job.status)
-                    continue
+                    summary.failed += 1
+                else:
+                    results = state.results_path(job.job_id)
+                    if not (job.fetched and results.is_file()):
+                        download_file(client, job.output_file, results)
+                    parts.append(split_results(results, state, force=force))
 
-                results = download_file(client, job.output_file, state.results_path(job.job_id))
-                part = split_results(results, state, force=force)
+                for part in parts:
+                    summary.written += part.written
+                    summary.failed += part.failed
+                    summary.skipped += part.skipped
+                    summary.unknown += part.unknown
+                    summary.malformed += part.malformed
 
-                summary.written += part.written
-                summary.failed += part.failed
-                summary.skipped += part.skipped
-                summary.unknown += part.unknown
-                summary.malformed += part.malformed
+                for custom_id in job.custom_ids:
+                    document = state.documents.get(custom_id)
+                    if document is None:
+                        summary.unknown += 1
+                        continue
+                    paths = output_paths(output_dir, Path(document.relative_path))
+                    if (
+                        not (
+                            document.ocr_written
+                            and paths.ocr_md.is_file()
+                            and paths.ocr_json.is_file()
+                        )
+                        and not document.ocr_error
+                    ):
+                        document.ocr_error = "no successful OCR result returned"
+                        summary.failed += 1
+                        log.error("OCR failed: %s: %s", document.relative_path, document.ocr_error)
 
                 job.fetched = True
+                state.save()
 
-            state.save()
             state.write_manifest()
 
             log.info("OCR results: %s", summary)
@@ -501,7 +553,13 @@ def do_fetch(
         )
         return EXIT_PARTIAL
 
-    problems = summary.failed + summary.unknown + summary.malformed
+    problems = (
+        summary.failed
+        + summary.unknown
+        + summary.malformed
+        + sum(job.failed_requests for job in state.jobs)
+        + sum(bool(document.ocr_error) for document in state.documents.values())
+    )
     native_failures = sum(1 for document in state.documents.values() if document.native_error)
 
     if problems or native_failures:

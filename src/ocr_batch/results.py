@@ -63,6 +63,9 @@ def _failure_reason(row: dict[str, Any]) -> str:
     response = row.get("response") or {}
     status = response.get("status_code")
 
+    if status is not None and response.get("body"):
+        return f"HTTP {status}: {json.dumps(response['body'], ensure_ascii=False)}"
+
     return f"no response body (status {status})" if status else "no response body"
 
 
@@ -91,6 +94,11 @@ def split_results(
                 summary.malformed += 1
                 continue
 
+            if not isinstance(row, dict) or not isinstance(row.get("custom_id"), str):
+                log.warning("%s:%d: malformed result row", results_path.name, number)
+                summary.malformed += 1
+                continue
+
             custom_id = row.get("custom_id")
             document = state.documents.get(custom_id) if custom_id else None
 
@@ -104,13 +112,38 @@ def split_results(
                 summary.unknown += 1
                 continue
 
-            body = (row.get("response") or {}).get("body")
+            response = row.get("response")
+            if response is not None and not isinstance(response, dict):
+                document.ocr_written = False
+                document.ocr_error = "malformed response"
+                summary.malformed += 1
+                continue
+            response = response or {}
+            body = response.get("body")
+            status = response.get("status_code")
 
-            if not isinstance(body, dict):
+            if (
+                row.get("error")
+                or row.get("errors")
+                or not isinstance(body, dict)
+                or (status is not None and (not isinstance(status, int) or not 200 <= status < 300))
+            ):
                 reason = _failure_reason(row)
+                document.ocr_written = False
                 document.ocr_error = reason
                 log.error("OCR failed: %s: %s", document.relative_path, reason)
                 summary.failed += 1
+                continue
+
+            try:
+                if not isinstance(body.get("pages"), list):
+                    raise ValueError("pages must be a list")
+                markdown = render_markdown(body)
+            except (AttributeError, TypeError, ValueError) as exc:
+                document.ocr_written = False
+                document.ocr_error = f"malformed OCR body: {exc}"
+                log.warning("%s:%d: %s", results_path.name, number, document.ocr_error)
+                summary.malformed += 1
                 continue
 
             paths = output_paths(state.output_dir, Path(document.relative_path))
@@ -129,7 +162,7 @@ def split_results(
                 json.dumps(body, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
-            paths.ocr_md.write_text(render_markdown(body), encoding="utf-8")
+            paths.ocr_md.write_text(markdown, encoding="utf-8")
 
             document.ocr_written = True
             document.ocr_error = None

@@ -1,10 +1,12 @@
+import json
 from pathlib import Path
 
 import pytest
-from conftest import Corpus, FakeMistral, batch_line
+from conftest import Corpus, FakeMistral, batch_line, write_pdf
 
 from ocr_batch import cli
 from ocr_batch.errors import CollisionError, ConfigError, RemoteError, StateError
+from ocr_batch.paths import file_sha256, output_paths
 from ocr_batch.state import RunState
 
 
@@ -91,15 +93,21 @@ def test_fetch_resumes_from_disk_without_re_uploading(
     assert len(patched_client.submitted) == 4  # no second batch job
 
 
+@pytest.mark.parametrize("force", [False, True])
 def test_a_second_submit_refuses_to_re_pay_for_a_running_job(
-    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral, force: bool
 ):
     out = tmp_path / "out"
     patched_client.job_status = "RUNNING"
     cli.do_submit(corpus.root, out, options())
+    before = (out / "_state.json").read_bytes()
 
     with pytest.raises(StateError, match="already has running batch job"):
-        cli.do_submit(corpus.root, out, options())
+        cli.do_submit(corpus.root, out, options(force=force))
+
+    assert (out / "_state.json").read_bytes() == before
+    assert cli.do_cleanup(out) == cli.EXIT_ERROR
+    assert patched_client.deleted == []
 
 
 def test_completed_documents_are_skipped_unless_forced(
@@ -374,3 +382,198 @@ def test_a_missing_api_key_fails_before_any_work(
 def test_submit_options_reject_non_positive_numbers(field: str, value: int):
     with pytest.raises(ConfigError, match=field.replace("_", "-")):
         options(**{field: value})
+
+
+def completed_run(tmp_path: Path, client: FakeMistral) -> tuple[Path, Path, RunState]:
+    root = tmp_path / "in"
+    write_pdf(root / "a.pdf", "OLD SOURCE")
+    out = tmp_path / "out"
+    state = cli.do_submit(root, out, options())
+    custom_id = next(iter(state.documents))
+    client.downloads["out-1"] = (batch_line(custom_id, "OLD OCR") + "\n").encode()
+    assert cli.do_fetch(out) == cli.EXIT_OK
+    return root, out, RunState.load(out)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_terminal_unfetched_job_is_preserved(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral, force: bool
+):
+    out = tmp_path / "out"
+    state = cli.do_submit(corpus.root, out, options(native=False))
+    cli.do_status(out)
+    before = (out / "_state.json").read_bytes()
+
+    with pytest.raises(StateError, match="unfetched"):
+        cli.do_submit(corpus.root, out, options(force=force))
+
+    assert (out / "_state.json").read_bytes() == before
+    assert len(patched_client.jobs) == 1
+    patched_client.downloads["out-1"] = results_for(state)
+    assert cli.do_fetch(out) == cli.EXIT_OK
+
+
+def test_changed_source_redoes_native_and_ocr(tmp_path: Path, patched_client: FakeMistral):
+    root, out, previous = completed_run(tmp_path, patched_client)
+    write_pdf(root / "a.pdf", "NEW SOURCE")
+
+    state = cli.do_submit(root, out, options())
+    custom_id = next(iter(state.documents))
+    paths = output_paths(out, Path("a.pdf"))
+    assert state.documents[custom_id].sha256 != previous.documents[custom_id].sha256
+    assert state.documents[custom_id].sha256 == file_sha256(root / "a.pdf")
+    assert "NEW SOURCE" in paths.native.read_text()
+    assert len(patched_client.submitted) == 2
+    patched_client.downloads["out-1"] = (batch_line(custom_id, "NEW OCR") + "\n").encode()
+
+    assert cli.do_fetch(out) == cli.EXIT_OK
+    assert "NEW OCR" in paths.ocr_md.read_text()
+
+
+def test_forced_submit_is_followed_by_an_ordinary_fetch(
+    tmp_path: Path, patched_client: FakeMistral
+):
+    root, out, _ = completed_run(tmp_path, patched_client)
+    state = cli.do_submit(root, out, options(force=True, native=False))
+    custom_id = next(iter(state.documents))
+    assert not state.documents[custom_id].ocr_written
+    patched_client.downloads["out-1"] = (batch_line(custom_id, "NEW OCR") + "\n").encode()
+
+    assert cli.do_fetch(out) == cli.EXIT_OK
+    assert "NEW OCR" in (out / "a.ocr.md").read_text()
+
+
+def test_fetch_counts_and_records_separate_request_errors(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    patched_client.error_file = "err-1"
+    state = cli.do_submit(corpus.root, out, options(native=False))
+    failed_id, *successful_ids = state.documents
+    patched_client.jobs["job-1"].failed_requests = 1
+    patched_client.downloads["out-1"] = (
+        "\n".join(batch_line(custom_id) for custom_id in successful_ids) + "\n"
+    ).encode()
+    patched_client.downloads["err-1"] = (
+        json.dumps({"custom_id": failed_id, "error": {"message": "OCR failed"}}) + "\n"
+    ).encode()
+
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+    saved = RunState.load(out)
+    assert "OCR failed" in (saved.documents[failed_id].ocr_error or "")
+    assert not saved.documents[failed_id].ocr_written
+    assert saved.jobs[0].failed_requests == 1
+    patched_client.downloads.clear()
+    patched_client.jobs.clear()
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+
+
+def test_missing_result_is_a_failure_on_every_fetch(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    state = cli.do_submit(corpus.root, out, options(native=False))
+    missing_id, *successful_ids = state.documents
+    patched_client.downloads["out-1"] = (
+        "\n".join(batch_line(custom_id) for custom_id in successful_ids) + "\n"
+    ).encode()
+
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+    assert RunState.load(out).documents[missing_id].ocr_error == "no successful OCR result returned"
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+
+
+def test_success_job_without_output_is_partial_and_can_be_retried(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    patched_client.output_file = None
+    cli.do_submit(corpus.root, out, options(native=False))
+
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+    assert RunState.load(out).jobs[0].fetched
+    assert cli.do_submit(corpus.root, out, options(native=False)).jobs
+
+
+def test_cached_fetch_restores_outputs_without_remote_access(
+    tmp_path: Path, patched_client: FakeMistral
+):
+    _, out, _ = completed_run(tmp_path, patched_client)
+    (out / "a.ocr.md").unlink()
+    (out / "a.ocr.json").unlink()
+    patched_client.downloads.clear()
+    patched_client.jobs.clear()
+
+    assert cli.do_fetch(out) == cli.EXIT_OK
+    assert "OLD OCR" in (out / "a.ocr.md").read_text()
+    assert (out / "a.ocr.json").is_file()
+    assert cli.do_fetch(out, force=True) == cli.EXIT_OK
+
+
+def test_remote_failure_count_survives_cached_fetch(tmp_path: Path, patched_client: FakeMistral):
+    root = tmp_path / "in"
+    write_pdf(root / "a.pdf", "source")
+    out = tmp_path / "out"
+    state = cli.do_submit(root, out, options(native=False))
+    patched_client.jobs["job-1"].failed_requests = 1
+    patched_client.downloads["out-1"] = results_for(state)
+
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+    patched_client.jobs.clear()
+    patched_client.downloads.clear()
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+
+
+def test_interrupted_uploads_are_saved_and_deleted(
+    corpus: Corpus,
+    tmp_path: Path,
+    patched_client: FakeMistral,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from concurrent.futures import Future
+
+    from ocr_batch.remote import Upload
+
+    def interrupt(futures: list[Future[Upload]]) -> None:
+        for future in futures:
+            future.result()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ocr_batch.remote.as_completed", interrupt)
+    out = tmp_path / "out"
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.do_submit(corpus.root, out, options(native=False))
+
+    state = RunState.load(out)
+    assert len(state.remote_files) == 4
+    assert state.pending_remote_files() == []
+    assert len(patched_client.deleted) == 4
+    assert not patched_client.jobs
+
+
+def test_fetch_resumes_multiple_jobs_after_a_later_download_fails(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    state = cli.do_submit(corpus.root, out, options(native=False, batch_size=2))
+    for number, job in enumerate(state.jobs, 1):
+        patched_client.jobs[job.job_id].output_file = f"out-{number}"
+    first, second = state.jobs
+    patched_client.downloads["out-1"] = (
+        "\n".join(batch_line(custom_id) for custom_id in first.custom_ids) + "\n"
+    ).encode()
+
+    with pytest.raises(RemoteError):
+        cli.do_fetch(out, keep_remote=True)
+
+    assert RunState.load(out).jobs[0].fetched
+    del patched_client.jobs[first.job_id]
+    del patched_client.downloads["out-1"]
+    patched_client.downloads["out-2"] = (
+        "\n".join(batch_line(custom_id) for custom_id in second.custom_ids) + "\n"
+    ).encode()
+
+    assert cli.do_fetch(out) == cli.EXIT_OK
+    assert all(job.fetched for job in RunState.load(out).jobs)
+    assert len(patched_client.deleted) == 4

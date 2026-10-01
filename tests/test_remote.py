@@ -1,5 +1,6 @@
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -168,3 +169,67 @@ def test_delete_reports_only_the_failures(fake_client: FakeMistral):
 
     assert set(failures) == {"file-2"}
     assert fake_client.deleted == ["file-1", "file-3"]
+
+
+@pytest.mark.parametrize("signed_url_failure", [False, True])
+def test_interrupt_during_collection_still_records_uploaded_files(
+    tmp_path: Path,
+    fake_client: FakeMistral,
+    monkeypatch: pytest.MonkeyPatch,
+    signed_url_failure: bool,
+):
+    from concurrent.futures import Future
+
+    source = tmp_path / "a.pdf"
+    source.write_bytes(b"pdf")
+    if signed_url_failure:
+        fake_client.fail_signed_url_for = {"file-1"}
+
+    def interrupt(futures: list[Future[Upload]]) -> None:
+        for future in futures:
+            with suppress(UploadError):
+                future.result()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ocr_batch.remote.as_completed", interrupt)
+    recorded: list[str] = []
+    orphans: list[str] = []
+
+    with pytest.raises(KeyboardInterrupt):
+        upload_documents(
+            fake_client,
+            [("id1", source)],
+            workers=1,
+            url_expiry_hours=24,
+            upload_expiry_hours=48,
+            on_upload=lambda upload: recorded.append(upload.file_id),
+            on_orphan=orphans.append,
+        )
+
+    assert recorded + orphans == ["file-1"]
+    assert bool(orphans) == signed_url_failure
+
+
+def test_interrupted_download_keeps_the_previous_cache(
+    tmp_path: Path, fake_client: FakeMistral, monkeypatch: pytest.MonkeyPatch
+):
+    from collections.abc import Generator
+
+    from conftest import FakeDownload
+
+    class BrokenDownload(FakeDownload):
+        def iter_bytes(self, size: int = 65536) -> Generator[bytes]:
+            yield b"truncated replacement"
+            raise RuntimeError("stream interrupted")
+
+    response = BrokenDownload(b"")
+    monkeypatch.setattr(fake_client.files, "download", lambda **kwargs: response)
+    destination = tmp_path / "results.jsonl"
+    destination.write_bytes(b"complete previous cache")
+
+    with pytest.raises(RuntimeError, match="stream interrupted"):
+        download_file(fake_client, "out-1", destination)
+
+    assert destination.read_bytes() == b"complete previous cache"
+    assert response.closed
+    assert list(tmp_path.iterdir()) == [destination]
