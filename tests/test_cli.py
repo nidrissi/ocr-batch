@@ -532,13 +532,14 @@ def test_missing_result_is_a_failure_on_every_fetch(
 
 
 def test_success_job_without_output_is_partial_and_can_be_retried(
-    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral, caplog: pytest.LogCaptureFixture
 ):
     out = tmp_path / "out"
     patched_client.output_file = None
     cli.do_submit(corpus.root, out, options(native=False))
 
     assert cli.do_fetch(out) == cli.EXIT_PARTIAL
+    assert "OCR results: 0 written, 4 failed" in caplog.text
     assert RunState.load(out).jobs[0].fetched
     assert cli.do_submit(corpus.root, out, options(native=False)).jobs
 

@@ -491,7 +491,6 @@ def do_fetch(
 
                 if not job.output_file:
                     log.error("job %s [%s] produced no output file", job.job_id, job.status)
-                    summary.failed += 1
                 else:
                     results = state.results_path(job.job_id)
                     if not (job.fetched and results.is_file()):
@@ -700,7 +699,9 @@ def _add_submit_options(parser: argparse.ArgumentParser) -> None:
         "--no-ocr", dest="ocr", action="store_false", help="skip the Mistral batch OCR entirely"
     )
     parser.add_argument(
-        "--force", action="store_true", help="redo work whose output files already exist"
+        "--force",
+        action="store_true",
+        help="redo completed work and discard unfetched finished jobs",
     )
     parser.add_argument(
         "--jobs", type=int, default=None, help="local extraction processes (default: one per CPU)"

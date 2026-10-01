@@ -57,9 +57,10 @@ submitted jobs are resumable because their ids and uploaded file ids are kept in
 
 If a `run` is interrupted, the job keeps going on Mistral's side; pick it back up
 with `ocr-batch fetch OUT`. Recorded live jobs are not submitted twice: `submit`
-refuses to start while a job from a previous run is still live or unfetched,
-even with `--force`. Fetch that run before submitting again. Documents with
-unchanged content and recorded complete outputs are skipped; `--force` redoes them.
+refuses to start while a job from a previous run is still live, even with
+`--force`, or finished but unfetched (`--force` discards such jobs). Documents
+with unchanged content and recorded complete outputs are skipped; `--force`
+redoes them.
 
 ### Output layout
 
@@ -83,7 +84,7 @@ are refused before anything is uploaded.
 
 ```
 --no-ocr / --no-native        run only one of the two extraction paths
---force                       redo completed work (pending jobs must be fetched first)
+--force                       redo completed work, discarding unfetched finished jobs
 --jobs N                      local extraction processes (default: one per CPU)
 --upload-workers N            concurrent uploads (default: 8)
 --batch-size N                requests per batch job (default: 500)
