@@ -505,10 +505,7 @@ def do_fetch(
                     summary.malformed += part.malformed
 
                 for custom_id in job.custom_ids:
-                    document = state.documents.get(custom_id)
-                    if document is None:
-                        summary.unknown += 1
-                        continue
+                    document = state.documents[custom_id]
                     paths = output_paths(output_dir, Path(document.relative_path))
                     if (
                         not (
@@ -562,13 +559,14 @@ def do_fetch(
     if unsubmitted:
         log.error("%d document(s) never reached a batch job; run submit again", unsubmitted)
 
+    incomplete = sum(
+        1 for document in state.documents.values() if not document.ocr_written or document.ocr_error
+    )
     problems = (
-        summary.failed
+        incomplete
         + summary.unknown
         + summary.malformed
         + sum(job.failed_requests for job in state.jobs)
-        + sum(bool(document.ocr_error) for document in state.documents.values())
-        + unsubmitted
     )
     native_failures = sum(1 for document in state.documents.values() if document.native_error)
 

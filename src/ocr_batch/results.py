@@ -135,26 +135,27 @@ def split_results(
                 summary.failed += 1
                 continue
 
+            paths = output_paths(state.output_dir, Path(document.relative_path))
+
             try:
                 if not isinstance(body.get("pages"), list):
                     raise ValueError("pages must be a list")
+
+                if (
+                    document.ocr_written
+                    and paths.ocr_md.exists()
+                    and paths.ocr_json.exists()
+                    and not force
+                ):
+                    summary.skipped += 1
+                    continue
+
                 markdown = render_markdown(body)
             except (AttributeError, TypeError, ValueError) as exc:
                 document.ocr_written = False
                 document.ocr_error = f"malformed OCR body: {exc}"
                 log.warning("%s:%d: %s", results_path.name, number, document.ocr_error)
                 summary.malformed += 1
-                continue
-
-            paths = output_paths(state.output_dir, Path(document.relative_path))
-
-            if (
-                document.ocr_written
-                and paths.ocr_md.exists()
-                and paths.ocr_json.exists()
-                and not force
-            ):
-                summary.skipped += 1
                 continue
 
             paths.ocr_md.parent.mkdir(parents=True, exist_ok=True)
