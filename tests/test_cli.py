@@ -395,9 +395,8 @@ def completed_run(tmp_path: Path, client: FakeMistral) -> tuple[Path, Path, RunS
     return root, out, RunState.load(out)
 
 
-@pytest.mark.parametrize("force", [False, True])
 def test_terminal_unfetched_job_is_preserved(
-    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral, force: bool
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
 ):
     out = tmp_path / "out"
     state = cli.do_submit(corpus.root, out, options(native=False))
@@ -405,12 +404,61 @@ def test_terminal_unfetched_job_is_preserved(
     before = (out / "_state.json").read_bytes()
 
     with pytest.raises(StateError, match="unfetched"):
-        cli.do_submit(corpus.root, out, options(force=force))
+        cli.do_submit(corpus.root, out, options())
 
     assert (out / "_state.json").read_bytes() == before
     assert len(patched_client.jobs) == 1
     patched_client.downloads["out-1"] = results_for(state)
     assert cli.do_fetch(out) == cli.EXIT_OK
+
+
+def test_force_discards_a_terminal_job_that_cannot_be_fetched(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    cli.do_submit(corpus.root, out, options(native=False))
+    cli.do_status(out)
+
+    with pytest.raises(RemoteError):
+        cli.do_fetch(out, keep_remote=True)  # the output file is gone
+
+    state = cli.do_submit(corpus.root, out, options(native=False, force=True))
+
+    assert [job.job_id for job in state.jobs] == ["job-2"]
+    assert len(state.pending_remote_files()) == 8  # job-1's uploads still tracked
+
+
+def test_a_failed_forced_submit_keeps_the_record_of_existing_outputs(
+    tmp_path: Path, patched_client: FakeMistral
+):
+    root, out, _ = completed_run(tmp_path, patched_client)
+    patched_client.fail_upload_for = {"a.pdf"}
+
+    with pytest.raises(Exception, match="upload boom"):
+        cli.do_submit(root, out, options(force=True, native=False))
+
+    assert all(document.ocr_written for document in RunState.load(out).documents.values())
+    patched_client.fail_upload_for = set()
+    uploads = len(patched_client.uploaded)
+    assert not cli.do_submit(root, out, options(native=False)).jobs
+    assert len(patched_client.uploaded) == uploads
+
+
+def test_documents_that_never_reached_a_job_make_fetch_partial(
+    corpus: Corpus, tmp_path: Path, patched_client: FakeMistral
+):
+    out = tmp_path / "out"
+    patched_client.fail_create_at = {1}
+
+    with pytest.raises(Exception, match="create boom"):
+        cli.do_submit(corpus.root, out, options(native=False, batch_size=2))
+
+    (job,) = RunState.load(out).jobs
+    patched_client.downloads["out-1"] = (
+        "\n".join(batch_line(custom_id) for custom_id in job.custom_ids) + "\n"
+    ).encode()
+
+    assert cli.do_fetch(out) == cli.EXIT_PARTIAL
 
 
 def test_changed_source_redoes_native_and_ocr(tmp_path: Path, patched_client: FakeMistral):

@@ -233,3 +233,43 @@ def test_interrupted_download_keeps_the_previous_cache(
     assert destination.read_bytes() == b"complete previous cache"
     assert response.closed
     assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_second_interrupt_while_draining_still_records_the_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_client: FakeMistral
+):
+    from concurrent.futures import Future
+    from concurrent.futures import wait as real_wait
+
+    release = threading.Event()
+
+    def slow_upload(client: object, *, custom_id: str, **kwargs: object) -> Upload:
+        release.wait(timeout=5)
+        return Upload(custom_id, "file-1", "https://example.invalid/file-1")
+
+    def interrupt(futures: list[Future[Upload]]) -> None:
+        raise KeyboardInterrupt
+
+    def interrupted_wait(futures: list[Future[Upload]]) -> object:
+        if not release.is_set():
+            release.set()
+            raise KeyboardInterrupt
+        return real_wait(futures)
+
+    monkeypatch.setattr("ocr_batch.remote.upload_document", slow_upload)
+    monkeypatch.setattr("ocr_batch.remote.as_completed", interrupt)
+    monkeypatch.setattr("ocr_batch.remote.wait", interrupted_wait)
+    recorded: list[str] = []
+
+    with pytest.raises(KeyboardInterrupt):
+        upload_documents(
+            fake_client,
+            [("id1", tmp_path / "a.pdf")],
+            workers=1,
+            url_expiry_hours=24,
+            upload_expiry_hours=48,
+            on_upload=lambda upload: recorded.append(upload.file_id),
+            on_orphan=lambda file_id: None,
+        )
+
+    assert recorded == ["file-1"]

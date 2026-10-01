@@ -154,10 +154,10 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
             "Use `ocr-batch status` / `ocr-batch fetch` before submitting again."
         )
 
-    if previous is not None and any(not job.fetched for job in previous.jobs):
+    if previous is not None and not opts.force and any(not job.fetched for job in previous.jobs):
         raise StateError(
             f"{output_dir} has unfetched batch job(s). "
-            "Use `ocr-batch fetch` before submitting again."
+            "Use `ocr-batch fetch` before submitting again, or --force to discard them."
         )
 
     state = RunState.create(output_dir=output_dir, input_dir=input_dir, model=opts.model)
@@ -183,9 +183,8 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
             if not (opts.force and opts.native):
                 document.native_pages = old.native_pages
                 document.native_error = old.native_error
-            if not (opts.force and opts.ocr):
-                document.ocr_written = old.ocr_written
-                document.ocr_error = old.ocr_error
+            document.ocr_written = old.ocr_written
+            document.ocr_error = old.ocr_error
 
         state.documents[custom_id] = document
 
@@ -254,7 +253,11 @@ def _submit_ocr(
     def on_job(job_id: str, custom_ids: list[str]) -> None:
         state.jobs.append(JobState(job_id=job_id, custom_ids=custom_ids))
 
+        # Only now is the previous OCR output superseded.
         for custom_id in custom_ids:
+            state.documents[custom_id].ocr_written = False
+            state.documents[custom_id].ocr_error = None
+
             if (remote := by_custom_id.get(custom_id)) is not None:
                 remote.job_id = job_id
 
@@ -313,11 +316,7 @@ def do_submit(
             or not paths.ocr_md.is_file()
             or not paths.ocr_json.is_file()
         ):
-            document.ocr_written = False
-            document.ocr_error = None
             ocr_targets.append((custom_id, source))
-
-    state.save()
 
     if not native_targets and not ocr_targets:
         log.info("nothing to do: every output already exists (use --force to redo)")
@@ -553,12 +552,24 @@ def do_fetch(
         )
         return EXIT_PARTIAL
 
+    # Every document in a job now has output or an error; the rest never got
+    # into one (e.g. submit failed between jobs).
+    unsubmitted = sum(
+        1
+        for document in state.documents.values()
+        if not document.ocr_written and not document.ocr_error
+    )
+
+    if unsubmitted:
+        log.error("%d document(s) never reached a batch job; run submit again", unsubmitted)
+
     problems = (
         summary.failed
         + summary.unknown
         + summary.malformed
         + sum(job.failed_requests for job in state.jobs)
         + sum(bool(document.ocr_error) for document in state.documents.values())
+        + unsubmitted
     )
     native_failures = sum(1 for document in state.documents.values() if document.native_error)
 

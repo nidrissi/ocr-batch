@@ -9,7 +9,7 @@ import os
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -219,17 +219,25 @@ def upload_documents(
                 )
 
             for done, future in enumerate(as_completed(futures), 1):
-                record_upload(future)
                 recorded.add(future)
+                record_upload(future)
                 log.info("uploaded %d/%d", done, len(futures))
         except BaseException as exc:
             record_failure(exc)
         finally:
             # Ctrl-C can interrupt the iterator itself. Drain running uploads
-            # before propagating it so every remote id reaches cleanup.
+            # before propagating it so every remote id reaches cleanup; a
+            # further Ctrl-C must not abandon the wait.
             for future in futures:
-                if future not in recorded:
-                    record_upload(future)
+                if future in recorded:
+                    continue
+                while not future.done():
+                    try:
+                        wait([future])
+                    except KeyboardInterrupt as exc:
+                        record_failure(exc)
+                recorded.add(future)
+                record_upload(future)
 
     if failure is not None:
         raise failure
