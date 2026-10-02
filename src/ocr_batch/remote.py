@@ -5,9 +5,11 @@ module can be driven by a fake in tests.
 """
 
 import logging
+import os
+import tempfile
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -163,17 +165,8 @@ def upload_documents(
     failure: BaseException | None = None
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                upload_document,
-                client,
-                custom_id=custom_id,
-                path=path,
-                url_expiry_hours=url_expiry_hours,
-                upload_expiry_hours=upload_expiry_hours,
-            ): custom_id
-            for custom_id, path in items
-        }
+        futures: list[Future[Upload]] = []
+        recorded: set[Future[Upload]] = set()
 
         def record_failure(exc: BaseException) -> None:
             nonlocal failure
@@ -186,11 +179,11 @@ def upload_documents(
             for future in futures:
                 future.cancel()
 
-        for done, future in enumerate(as_completed(futures), 1):
+        def record_upload(future: Future[Upload]) -> None:
             try:
                 upload = future.result()
             except CancelledError:
-                continue
+                return
             except UploadError as exc:
                 record_failure(exc)
 
@@ -200,10 +193,10 @@ def upload_documents(
                     except BaseException as callback_exc:
                         record_failure(callback_exc)
 
-                continue
+                return
             except BaseException as exc:
                 record_failure(exc)
-                continue
+                return
 
             uploads.append(upload)
 
@@ -212,7 +205,39 @@ def upload_documents(
             except BaseException as exc:
                 record_failure(exc)
 
-            log.info("uploaded %d/%d", done, len(futures))
+        try:
+            for custom_id, path in items:
+                futures.append(
+                    pool.submit(
+                        upload_document,
+                        client,
+                        custom_id=custom_id,
+                        path=path,
+                        url_expiry_hours=url_expiry_hours,
+                        upload_expiry_hours=upload_expiry_hours,
+                    )
+                )
+
+            for done, future in enumerate(as_completed(futures), 1):
+                recorded.add(future)
+                record_upload(future)
+                log.info("uploaded %d/%d", done, len(futures))
+        except BaseException as exc:
+            record_failure(exc)
+        finally:
+            # Ctrl-C can interrupt the iterator itself. Drain running uploads
+            # before propagating it so every remote id reaches cleanup; a
+            # further Ctrl-C must not abandon the wait.
+            for future in futures:
+                if future in recorded:
+                    continue
+                while not future.done():
+                    try:
+                        wait([future])
+                    except KeyboardInterrupt as exc:
+                        record_failure(exc)
+                recorded.add(future)
+                record_upload(future)
 
     if failure is not None:
         raise failure
@@ -361,11 +386,18 @@ def download_file(client: MistralClient, file_id: str, destination: Path) -> Pat
 
     destination.parent.mkdir(parents=True, exist_ok=True)
 
+    temp_path: Path | None = None
     try:
-        with destination.open("wb") as out:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False
+        ) as out:
+            temp_path = Path(out.name)
             for chunk in response.iter_bytes(DOWNLOAD_CHUNK):
                 out.write(chunk)
+        os.replace(temp_path, destination)
     finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
         response.close()
 
     return destination

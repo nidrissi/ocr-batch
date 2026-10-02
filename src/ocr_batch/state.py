@@ -97,6 +97,7 @@ class JobState:
     output_file: str | None = None
     error_file: str | None = None
     fetched: bool = False
+    failed_requests: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -111,6 +112,7 @@ class JobState:
             output_file=data.get("output_file"),
             error_file=data.get("error_file"),
             fetched=bool(data.get("fetched", False)),
+            failed_requests=data.get("failed_requests", 0),
         )
 
 
@@ -191,6 +193,7 @@ class RunState:
                     "output_file": job.output_file,
                     "error_file": job.error_file,
                     "fetched": job.fetched,
+                    "failed_requests": job.failed_requests,
                 }
                 for job in self.jobs
             ],

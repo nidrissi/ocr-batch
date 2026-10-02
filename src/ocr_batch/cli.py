@@ -42,7 +42,7 @@ from .state import DocumentState, JobState, RemoteFile, RunState
 
 log = logging.getLogger("ocr_batch")
 
-DEFAULT_MODEL = "mistral-ocr-4-0"
+DEFAULT_MODEL = "mistral-ocr-4-1"
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_UPLOAD_WORKERS = 8
 DEFAULT_TIMEOUT_HOURS = 24
@@ -147,11 +147,17 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
 
     previous = RunState.load_if_exists(output_dir)
 
-    if previous is not None and previous.active_jobs() and not opts.force:
+    if previous is not None and previous.active_jobs():
         active = ", ".join(job.job_id for job in previous.active_jobs())
         raise StateError(
             f"{output_dir} already has running batch job(s): {active}. "
-            "Use `ocr-batch status` / `ocr-batch fetch`, or --force to start over."
+            "Use `ocr-batch status` / `ocr-batch fetch` before submitting again."
+        )
+
+    if previous is not None and not opts.force and any(not job.fetched for job in previous.jobs):
+        raise StateError(
+            f"{output_dir} has unfetched batch job(s). "
+            "Use `ocr-batch fetch` before submitting again, or --force to discard them."
         )
 
     state = RunState.create(output_dir=output_dir, input_dir=input_dir, model=opts.model)
@@ -174,9 +180,11 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
         old = previous.documents.get(custom_id) if previous is not None else None
 
         if old is not None and old.sha256 == document.sha256:
-            document.native_pages = old.native_pages
-            document.native_error = old.native_error
+            if not (opts.force and opts.native):
+                document.native_pages = old.native_pages
+                document.native_error = old.native_error
             document.ocr_written = old.ocr_written
+            document.ocr_error = old.ocr_error
 
         state.documents[custom_id] = document
 
@@ -245,7 +253,11 @@ def _submit_ocr(
     def on_job(job_id: str, custom_ids: list[str]) -> None:
         state.jobs.append(JobState(job_id=job_id, custom_ids=custom_ids))
 
+        # Only now is the previous OCR output superseded.
         for custom_id in custom_ids:
+            state.documents[custom_id].ocr_written = False
+            state.documents[custom_id].ocr_error = None
+
             if (remote := by_custom_id.get(custom_id)) is not None:
                 remote.job_id = job_id
 
@@ -289,10 +301,21 @@ def do_submit(
         source = input_dir / rel
         paths = output_paths(output_dir, rel)
 
-        if opts.native and (opts.force or not paths.native.exists()):
+        if opts.native and (
+            opts.force
+            or document.native_pages is None
+            or document.native_error
+            or not paths.native.is_file()
+        ):
             native_targets.append((custom_id, source, paths.native))
 
-        if opts.ocr and (opts.force or not paths.ocr_md.exists() or not paths.ocr_json.exists()):
+        if opts.ocr and (
+            opts.force
+            or not document.ocr_written
+            or document.ocr_error
+            or not paths.ocr_md.is_file()
+            or not paths.ocr_json.is_file()
+        ):
             ocr_targets.append((custom_id, source))
 
     if not native_targets and not ocr_targets:
@@ -362,6 +385,7 @@ def _record_jobs(state: RunState, jobs: dict[str, Any]) -> None:
         job.status = str(remote_job.status)
         job.output_file = getattr(remote_job, "output_file", None)
         job.error_file = getattr(remote_job, "error_file", None)
+        job.failed_requests = getattr(remote_job, "failed_requests", 0) or 0
 
     state.save()
 
@@ -414,7 +438,7 @@ def do_fetch(
     if not state.jobs:
         raise StateError(f"no batch jobs recorded in {output_dir}")
 
-    job_ids = [job.job_id for job in state.jobs]
+    job_ids = [job.job_id for job in state.jobs if not (job.terminal and job.fetched)]
 
     with make_client(api_key) as client:
 
@@ -423,7 +447,9 @@ def do_fetch(
             log.info("mistral: %s", _describe(jobs, progress))
 
         try:
-            if wait:
+            if not job_ids:
+                jobs = {}
+            elif wait:
                 jobs = wait_for_jobs(client, job_ids, on_update=on_update)
             else:
                 jobs = refresh_jobs(client, job_ids)
@@ -455,26 +481,47 @@ def do_fetch(
 
         try:
             for job in state.jobs:
+                parts: list[SplitSummary] = []
                 if job.error_file:
-                    path = download_file(client, job.error_file, state.errors_path(job.job_id))
+                    path = state.errors_path(job.job_id)
+                    if not (job.fetched and path.is_file()):
+                        download_file(client, job.error_file, path)
                     log.warning("per-request errors written to %s", path)
+                    parts.append(split_results(path, state))
 
                 if not job.output_file:
                     log.error("job %s [%s] produced no output file", job.job_id, job.status)
-                    continue
+                else:
+                    results = state.results_path(job.job_id)
+                    if not (job.fetched and results.is_file()):
+                        download_file(client, job.output_file, results)
+                    parts.append(split_results(results, state, force=force))
 
-                results = download_file(client, job.output_file, state.results_path(job.job_id))
-                part = split_results(results, state, force=force)
+                for part in parts:
+                    summary.written += part.written
+                    summary.failed += part.failed
+                    summary.skipped += part.skipped
+                    summary.unknown += part.unknown
+                    summary.malformed += part.malformed
 
-                summary.written += part.written
-                summary.failed += part.failed
-                summary.skipped += part.skipped
-                summary.unknown += part.unknown
-                summary.malformed += part.malformed
+                for custom_id in job.custom_ids:
+                    document = state.documents[custom_id]
+                    paths = output_paths(output_dir, Path(document.relative_path))
+                    if (
+                        not (
+                            document.ocr_written
+                            and paths.ocr_md.is_file()
+                            and paths.ocr_json.is_file()
+                        )
+                        and not document.ocr_error
+                    ):
+                        document.ocr_error = "no successful OCR result returned"
+                        summary.failed += 1
+                        log.error("OCR failed: %s: %s", document.relative_path, document.ocr_error)
 
                 job.fetched = True
+                state.save()
 
-            state.save()
             state.write_manifest()
 
             log.info("OCR results: %s", summary)
@@ -501,7 +548,26 @@ def do_fetch(
         )
         return EXIT_PARTIAL
 
-    problems = summary.failed + summary.unknown + summary.malformed
+    # Every document in a job now has output or an error; the rest never got
+    # into one (e.g. submit failed between jobs).
+    unsubmitted = sum(
+        1
+        for document in state.documents.values()
+        if not document.ocr_written and not document.ocr_error
+    )
+
+    if unsubmitted:
+        log.error("%d document(s) never reached a batch job; run submit again", unsubmitted)
+
+    incomplete = sum(
+        1 for document in state.documents.values() if not document.ocr_written or document.ocr_error
+    )
+    problems = (
+        incomplete
+        + summary.unknown
+        + summary.malformed
+        + sum(job.failed_requests for job in state.jobs)
+    )
     native_failures = sum(1 for document in state.documents.values() if document.native_error)
 
     if problems or native_failures:
@@ -631,7 +697,9 @@ def _add_submit_options(parser: argparse.ArgumentParser) -> None:
         "--no-ocr", dest="ocr", action="store_false", help="skip the Mistral batch OCR entirely"
     )
     parser.add_argument(
-        "--force", action="store_true", help="redo work whose output files already exist"
+        "--force",
+        action="store_true",
+        help="redo completed work and discard unfetched finished jobs",
     )
     parser.add_argument(
         "--jobs", type=int, default=None, help="local extraction processes (default: one per CPU)"

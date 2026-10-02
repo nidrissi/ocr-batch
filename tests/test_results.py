@@ -107,3 +107,50 @@ def test_error_detail_is_recorded(tmp_path: Path):
     split_results(results, state)
 
     assert "rate limited" in (state.documents["id1"].ocr_error or "")
+
+
+@pytest.mark.parametrize("status", [400, 429, 500])
+def test_http_error_body_is_not_written_as_success(tmp_path: Path, status: int):
+    state = make_state(tmp_path, ("id1", "a.pdf"))
+    results = tmp_path / "r.jsonl"
+    results.write_text(
+        json.dumps(
+            {"custom_id": "id1", "response": {"status_code": status, "body": {"message": "boom"}}}
+        )
+        + "\n"
+    )
+
+    summary = split_results(results, state)
+
+    assert summary.failed == 1
+    assert not state.documents["id1"].ocr_written
+    assert "boom" in (state.documents["id1"].ocr_error or "")
+    assert not (tmp_path / "a.ocr.md").exists()
+    assert not (tmp_path / "a.ocr.json").exists()
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        [],
+        None,
+        42,
+        {"custom_id": ["id1"]},
+        {"custom_id": "id1", "response": "invalid"},
+        {"custom_id": "id1", "response": {"body": {"message": "not OCR"}}},
+        {"custom_id": "id1", "response": {"body": {"pages": [None]}}},
+        {"custom_id": "id1", "response": {"body": {"pages": [{"index": "zero"}]}}},
+        {"custom_id": "id1", "response": {"body": {"pages": [{"markdown": 42}]}}},
+    ],
+)
+def test_wrong_shaped_rows_do_not_abandon_good_results(tmp_path: Path, bad_row: object):
+    state = make_state(tmp_path, ("id1", "a.pdf"), ("id2", "b.pdf"))
+    results = tmp_path / "r.jsonl"
+    results.write_text(json.dumps(bad_row) + "\n" + batch_line("id2") + "\n")
+
+    summary = split_results(results, state)
+
+    assert summary.malformed == 1
+    assert summary.written == 1
+    assert (tmp_path / "b.ocr.md").is_file()
+    assert not (tmp_path / "a.ocr.json").exists()
