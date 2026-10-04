@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.0b3
+
+### Added
+
+- `--force` can discard completed but unfetched batch jobs; running jobs still
+  must be fetched before another submission.
+- Fetch can resume from cached result files, processes partial jobs safely, and
+  reports documents that never reached a job or returned no successful result.
+- The default OCR model is now `mistral-ocr-4-1`.
+
+### Fixed
+
+- Interrupted uploads are drained and recorded so uploaded files can be cleaned
+  up; interrupted downloads preserve the previous cache until replacement is
+  complete.
+- Malformed result rows and non-success HTTP responses are reported without
+  discarding valid rows. Server-reported failed requests are included in the
+  final failure count.
+- Failed submissions preserve existing OCR state until a replacement job is
+  created, and completed jobs can be fetched again from local result files.
+
+### Updated
+
+- The README now uses the PyPI installation command directly with `uvx`.
+- Runtime dependency `mistralai` is updated to 2.10.1; development tools Ruff
+  and Pyright are updated to 0.16.9 and 1.1.414.
+
 ## 0.1.0b1
 
 First beta. The pipeline from the initial draft is unchanged in spirit -- local

@@ -83,6 +83,7 @@ are refused before anything is uploaded.
 ### Useful flags
 
 ```
+--model ID                    Mistral OCR model (default: mistral-ocr-4-1)
 --no-ocr / --no-native        run only one of the two extraction paths
 --force                       redo completed work, discarding unfetched finished jobs
 --jobs N                      local extraction processes (default: one per CPU)

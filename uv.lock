@@ -144,7 +144,7 @@ wheels = [
 
 [[package]]
 name = "ocr-batch"
-version = "0.1.0b2"
+version = "0.1.0b3"
 source = { editable = "." }
 dependencies = [
     { name = "mistralai" },
