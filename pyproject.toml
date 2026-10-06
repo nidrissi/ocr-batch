@@ -7,7 +7,7 @@ authors = [
     { name = "Najib Idrissi-Kaïtouni", email = "najib.idrissi.kaitouni@outlook.com" },
 ]
 requires-python = ">=3.14"
-dependencies = ["mistralai>=2.9,<3", "pymupdf>=1.28"]
+dependencies = ["mistralai>=2.9,<4", "pymupdf>=1.28"]
 
 [project.scripts]
 ocr-batch = "ocr_batch:main"
