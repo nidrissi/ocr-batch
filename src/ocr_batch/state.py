@@ -10,7 +10,7 @@ before it is acted on.
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self
@@ -22,9 +22,19 @@ MANIFEST_FILENAME = "_manifest.json"
 RESULTS_FILENAME = "_mistral_batch_results.jsonl"
 ERRORS_FILENAME = "_mistral_batch_errors.jsonl"
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "TIMEOUT_EXCEEDED", "CANCELLED"})
+OPENAI_TERMINAL_STATUSES = frozenset({"completed", "failed", "expired", "cancelled"})
+
+
+def sync_directory(path: Path) -> None:
+    if os.name != "nt":
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def write_atomic(path: Path, data: str) -> None:
@@ -33,20 +43,31 @@ def write_atomic(path: Path, data: str) -> None:
     A partially written state file is worse than no state file at all, so the
     rename is the only thing that ever makes new content visible.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic_outputs({path: data})
 
-    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
 
+def write_atomic_outputs(outputs: dict[Path, str]) -> None:
+    """Prepare all files before publishing any, then atomically replace each file."""
+    staged: dict[Path, Path] = {}
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        for path, data in outputs.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+            )
+            staged[path] = Path(temp_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
 
-        os.replace(temp_name, path)
-    except BaseException:
-        Path(temp_name).unlink(missing_ok=True)
-        raise
+        for path, source in staged.items():
+            os.replace(source, path)
+        for parent in {path.parent for path in staged}:
+            sync_directory(parent)
+    finally:
+        for source in staged.values():
+            source.unlink(missing_ok=True)
 
 
 @dataclass(slots=True)
@@ -58,6 +79,17 @@ class DocumentState:
     native_error: str | None = None
     ocr_written: bool = False
     ocr_error: str | None = None
+    ocr_config: dict[str, Any] | None = None
+    ocr_sha256: str | None = None
+    ocr_pending: bool = False
+    expected_pages: int | None = None
+
+    def complete_ocr(self, configuration: dict[str, Any] | None) -> None:
+        self.ocr_config = configuration
+        self.ocr_sha256 = self.sha256
+        self.ocr_written = True
+        self.ocr_pending = False
+        self.ocr_error = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -69,6 +101,10 @@ class DocumentState:
             native_error=data.get("native_error"),
             ocr_written=bool(data.get("ocr_written", False)),
             ocr_error=data.get("ocr_error"),
+            ocr_config=data.get("ocr_config"),
+            ocr_sha256=data.get("ocr_sha256"),
+            ocr_pending=bool(data.get("ocr_pending", False)),
+            expected_pages=data.get("expected_pages"),
         )
 
 
@@ -78,6 +114,9 @@ class RemoteFile:
     custom_id: str | None = None
     job_id: str | None = None
     deleted: bool = False
+    role: str = "input"
+    deletion_error: str | None = None
+    awaiting_batch_until: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -86,7 +125,16 @@ class RemoteFile:
             custom_id=data.get("custom_id"),
             job_id=data.get("job_id"),
             deleted=bool(data.get("deleted", False)),
+            role=data.get("role", "input"),
+            deletion_error=data.get("deletion_error"),
+            awaiting_batch_until=data.get("awaiting_batch_until"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PageRequest:
+    document_id: str
+    page_index: int
 
 
 @dataclass(slots=True)
@@ -98,10 +146,12 @@ class JobState:
     error_file: str | None = None
     fetched: bool = False
     failed_requests: int = 0
+    configuration: dict[str, Any] | None = None
+    requests: dict[str, PageRequest] = field(default_factory=dict)
 
     @property
     def terminal(self) -> bool:
-        return self.status in TERMINAL_STATUSES
+        return self.status in TERMINAL_STATUSES or self.status in OPENAI_TERMINAL_STATUSES
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -113,6 +163,11 @@ class JobState:
             error_file=data.get("error_file"),
             fetched=bool(data.get("fetched", False)),
             failed_requests=data.get("failed_requests", 0),
+            configuration=data.get("configuration"),
+            requests={
+                request_id: PageRequest(**request)
+                for request_id, request in data.get("requests", {}).items()
+            },
         )
 
 
@@ -126,15 +181,27 @@ class RunState:
     documents: dict[str, DocumentState] = field(default_factory=dict)
     jobs: list[JobState] = field(default_factory=list)
     remote_files: list[RemoteFile] = field(default_factory=list)
+    provider: str | None = None
+    configuration: dict[str, Any] | None = None
 
     # -- construction -------------------------------------------------
 
     @classmethod
-    def create(cls, *, output_dir: Path, input_dir: Path, model: str) -> Self:
+    def create(
+        cls,
+        *,
+        output_dir: Path,
+        input_dir: Path,
+        model: str,
+        provider: str | None = None,
+        configuration: dict[str, Any] | None = None,
+    ) -> Self:
         return cls(
             output_dir=output_dir,
             input_dir=str(input_dir),
             model=model,
+            provider=provider,
+            configuration=configuration,
             created_at=datetime.now(UTC).isoformat(timespec="seconds"),
         )
 
@@ -159,16 +226,23 @@ class RunState:
         except (OSError, ValueError) as exc:
             raise StateError(f"could not read {path}: {exc}") from exc
 
-        if data.get("version") != STATE_VERSION:
+        version = data.get("version")
+        if version not in (1, STATE_VERSION):
             raise StateError(
                 f"{path} has state version {data.get('version')!r}, expected {STATE_VERSION}"
             )
+
+        provider = "mistral" if version == 1 else data.get("provider")
+        if provider not in (None, "mistral", "openai"):
+            raise StateError(f"{path} has unknown OCR provider {provider!r}")
 
         return cls(
             output_dir=output_dir,
             input_dir=data.get("input_dir", ""),
             model=data.get("model", ""),
             created_at=data.get("created_at", ""),
+            provider=provider,
+            configuration=data.get("configuration"),
             documents={
                 custom_id: DocumentState.from_dict(entry)
                 for custom_id, entry in data.get("documents", {}).items()
@@ -185,39 +259,11 @@ class RunState:
             "input_dir": self.input_dir,
             "model": self.model,
             "created_at": self.created_at,
-            "jobs": [
-                {
-                    "job_id": job.job_id,
-                    "custom_ids": job.custom_ids,
-                    "status": job.status,
-                    "output_file": job.output_file,
-                    "error_file": job.error_file,
-                    "fetched": job.fetched,
-                    "failed_requests": job.failed_requests,
-                }
-                for job in self.jobs
-            ],
-            "remote_files": [
-                {
-                    "file_id": remote.file_id,
-                    "custom_id": remote.custom_id,
-                    "job_id": remote.job_id,
-                    "deleted": remote.deleted,
-                }
-                for remote in self.remote_files
-            ],
-            "documents": {
-                custom_id: {
-                    "custom_id": doc.custom_id,
-                    "relative_path": doc.relative_path,
-                    "sha256": doc.sha256,
-                    "native_pages": doc.native_pages,
-                    "native_error": doc.native_error,
-                    "ocr_written": doc.ocr_written,
-                    "ocr_error": doc.ocr_error,
-                }
-                for custom_id, doc in self.documents.items()
-            },
+            "provider": self.provider,
+            "configuration": self.configuration,
+            "jobs": [asdict(job) for job in self.jobs],
+            "remote_files": [asdict(remote) for remote in self.remote_files],
+            "documents": {custom_id: asdict(doc) for custom_id, doc in self.documents.items()},
         }
 
     def save(self) -> None:
@@ -259,12 +305,16 @@ class RunState:
         A single-job run keeps the plain, predictable name; only multi-job runs
         need the id in the filename.
         """
+        if self.provider == "openai":
+            return self.output_dir / f"_openai_batch_results-{job_id}.jsonl"
         if len(self.jobs) <= 1:
             return self.output_dir / RESULTS_FILENAME
 
         return self.output_dir / f"_mistral_batch_results-{job_id}.jsonl"
 
     def errors_path(self, job_id: str) -> Path:
+        if self.provider == "openai":
+            return self.output_dir / f"_openai_batch_errors-{job_id}.jsonl"
         if len(self.jobs) <= 1:
             return self.output_dir / ERRORS_FILENAME
 

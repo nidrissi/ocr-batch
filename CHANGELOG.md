@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `run` and `submit` accept `--provider openai` with `OPENAI_API_KEY`. The
+  packaged SDK submits 200 DPI PNG pages to Responses Batch using
+  `gpt-6.1-terra` by default. Mistral remains the default provider.
+- OpenAI fetch assembles page-separated Markdown and a JSON envelope with
+  configuration, blank-page markers, and raw Responses bodies with usage.
+  Durable Batch output and error files support interrupted fetch and
+  reconstruction. Cleanup tracks input and result files independently.
+- The README covers installation, separate provider output directories,
+  resume commands, supported settings, service retention, and a manual OCR
+  comparison. `scripts/phase1_openai.py --yes` is an opt-in live smoke test.
+
+### Changed
+
+- State version 2 records the provider and successful output provenance
+  independently from replacement work. Version-1 Mistral jobs and uploads
+  remain resumable. The next OCR submission refreshes legacy outputs with
+  unknown settings.
+
 ## 0.1.0b3
 
 ### Added

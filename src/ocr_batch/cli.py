@@ -5,7 +5,7 @@ Five subcommands over one durable state file:
     submit   upload + create the batch job(s), and run local extraction
     status   one-shot progress report
     fetch    download and split results (idempotent, resumable)
-    cleanup  delete the uploaded originals from Mistral
+    cleanup  delete eligible remote files
     run      submit -> wait -> fetch -> cleanup
 """
 
@@ -15,10 +15,13 @@ import os
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from openai import OpenAI
+
+from . import openai_backend, openai_results
 from ._version import __version__
 from .errors import CollisionError, ConfigError, OcrBatchError, StateError
 from .native import NativePool
@@ -32,13 +35,14 @@ from .remote import (
     cancel_jobs,
     delete_files,
     download_file,
+    poll_jobs,
     refresh_jobs,
     submit_jobs,
     upload_documents,
     wait_for_jobs,
 )
 from .results import SplitSummary, split_results
-from .state import DocumentState, JobState, RemoteFile, RunState
+from .state import OPENAI_TERMINAL_STATUSES, DocumentState, JobState, RemoteFile, RunState
 
 log = logging.getLogger("ocr_batch")
 
@@ -56,7 +60,7 @@ EXIT_INTERRUPTED = 130
 
 @dataclass(slots=True)
 class SubmitOptions:
-    model: str = DEFAULT_MODEL
+    model: str | None = None
     native: bool = True
     ocr: bool = True
     force: bool = False
@@ -68,8 +72,16 @@ class SubmitOptions:
     upload_expiry_hours: int | None = None
     label: str = "ocr-batch"
     ocr_options: OcrOptions = field(default_factory=OcrOptions)
+    provider: str = "mistral"
 
     def __post_init__(self) -> None:
+        if self.provider not in ("mistral", "openai"):
+            raise ConfigError(f"unknown OCR provider {self.provider!r}")
+        if self.model is None:
+            self.model = (
+                openai_backend.DEFAULT_MODEL if self.provider == "openai" else DEFAULT_MODEL
+            )
+
         values = {
             "jobs": self.jobs,
             "upload-workers": self.upload_workers,
@@ -82,6 +94,19 @@ class SubmitOptions:
         for name, value in values.items():
             if value is not None and value <= 0:
                 raise ConfigError(f"--{name} must be positive")
+
+        if self.provider == "openai" and self.timeout_hours != openai_backend.TIMEOUT_HOURS:
+            raise ConfigError("OpenAI Batch requires --timeout-hours 24")
+
+    def configuration(self) -> dict[str, Any]:
+        assert self.model is not None
+        if self.provider == "openai":
+            return openai_backend.configuration(self.model)
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "ocr_options": asdict(self.ocr_options),
+        }
 
     @property
     def effective_upload_expiry_hours(self) -> int:
@@ -97,12 +122,13 @@ class SubmitOptions:
 # ----------------------------------------------------------------------
 
 
-def resolve_api_key(api_key: str | None = None) -> str:
+def resolve_api_key(api_key: str | None = None, provider: str = "mistral") -> str:
     """Resolve the API key, failing with a message rather than a KeyError."""
-    key = api_key or os.environ.get("MISTRAL_API_KEY")
+    variable = "OPENAI_API_KEY" if provider == "openai" else "MISTRAL_API_KEY"
+    key = api_key or os.environ.get(variable)
 
     if not key:
-        raise ConfigError("MISTRAL_API_KEY is not set; export it or pass --api-key")
+        raise ConfigError(f"{variable} is not set; export it or pass --api-key")
 
     return key
 
@@ -115,12 +141,30 @@ def make_client(api_key: str | None = None) -> Iterator[MistralClient]:
         yield client
 
 
+@contextmanager
+def make_openai_client(api_key: str | None = None) -> Iterator[OpenAI]:
+    # An ambiguous failure on batch creation must not trigger a second paid POST.
+    with OpenAI(api_key=resolve_api_key(api_key, "openai"), max_retries=0, timeout=120) as client:
+        yield client
+
+
 # ----------------------------------------------------------------------
 # submit
 # ----------------------------------------------------------------------
 
 
-def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> RunState:
+def _prepare_state(
+    input_dir: Path, output_dir: Path, opts: SubmitOptions, api_key: str | None = None
+) -> RunState:
+    previous = RunState.load_if_exists(output_dir)
+    if opts.ocr and previous is not None and previous.provider not in (None, opts.provider):
+        raise StateError(
+            f"{output_dir} already uses OCR provider {previous.provider!r}. "
+            f"Use a separate output directory for {opts.provider!r}."
+        )
+    if opts.ocr:
+        resolve_api_key(api_key, opts.provider)
+
     if not input_dir.is_dir():
         raise ConfigError(f"input directory does not exist: {input_dir}")
 
@@ -145,8 +189,6 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
             second,
         )
 
-    previous = RunState.load_if_exists(output_dir)
-
     if previous is not None and previous.active_jobs():
         active = ", ".join(job.job_id for job in previous.active_jobs())
         raise StateError(
@@ -160,7 +202,15 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
             "Use `ocr-batch fetch` before submitting again, or --force to discard them."
         )
 
+    assert opts.model is not None
     state = RunState.create(output_dir=output_dir, input_dir=input_dir, model=opts.model)
+    if opts.ocr:
+        state.provider = opts.provider
+        state.configuration = opts.configuration()
+    elif previous is not None:
+        state.provider = previous.provider
+        state.configuration = previous.configuration
+        state.model = previous.model
 
     # Carry over uploads the previous run never managed to delete, so cleanup
     # still knows about them.
@@ -171,20 +221,26 @@ def _prepare_state(input_dir: Path, output_dir: Path, opts: SubmitOptions) -> Ru
 
     for pdf, rel in zip(pdfs, rels, strict=True):
         custom_id = make_id(rel)
-        document = DocumentState(
-            custom_id=custom_id,
-            relative_path=rel.as_posix(),
-            sha256=file_sha256(pdf),
-        )
+        document = DocumentState(custom_id=custom_id, relative_path=rel.as_posix(), sha256="")
+        try:
+            document.sha256 = file_sha256(pdf)
+        except OSError as exc:
+            if not (opts.ocr and opts.provider == "openai"):
+                raise
+            document.ocr_error = f"could not read PDF: {exc}"
+            log.error("%s", document.ocr_error)
 
         old = previous.documents.get(custom_id) if previous is not None else None
 
-        if old is not None and old.sha256 == document.sha256:
-            if not (opts.force and opts.native):
-                document.native_pages = old.native_pages
-                document.native_error = old.native_error
-            document.ocr_written = old.ocr_written
-            document.ocr_error = old.ocr_error
+        if old is not None:
+            document.ocr_config = old.ocr_config
+            document.ocr_sha256 = old.ocr_sha256
+            if document.sha256 and old.sha256 == document.sha256:
+                if not (opts.force and opts.native):
+                    document.native_pages = old.native_pages
+                    document.native_error = old.native_error
+                document.ocr_written = old.ocr_written
+                document.ocr_error = old.ocr_error
 
         state.documents[custom_id] = document
 
@@ -251,9 +307,12 @@ def _submit_ocr(
     by_custom_id = {remote.custom_id: remote for remote in state.remote_files}
 
     def on_job(job_id: str, custom_ids: list[str]) -> None:
-        state.jobs.append(JobState(job_id=job_id, custom_ids=custom_ids))
+        state.jobs.append(
+            JobState(job_id=job_id, custom_ids=custom_ids, configuration=state.configuration)
+        )
 
-        # Only now is the previous OCR output superseded.
+        # This attempt now has a job. The old files and their provenance remain
+        # until a replacement is written.
         for custom_id in custom_ids:
             state.documents[custom_id].ocr_written = False
             state.documents[custom_id].ocr_error = None
@@ -271,7 +330,7 @@ def _submit_ocr(
     submit_jobs(
         client,
         requests,
-        model=opts.model,
+        model=state.model,
         timeout_hours=opts.timeout_hours,
         batch_size=opts.batch_size,
         metadata={"purpose": opts.label},
@@ -285,13 +344,7 @@ def do_submit(
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
 
-    if opts.ocr:
-        # Fail before hashing and uploading anything if we have no credentials.
-        resolve_api_key(api_key)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    state = _prepare_state(input_dir, output_dir, opts)
+    state = _prepare_state(input_dir, output_dir, opts, api_key)
 
     native_targets: list[tuple[str, Path, Path]] = []
     ocr_targets: list[tuple[str, Path]] = []
@@ -309,25 +362,42 @@ def do_submit(
         ):
             native_targets.append((custom_id, source, paths.native))
 
-        if opts.ocr and (
-            opts.force
-            or not document.ocr_written
-            or document.ocr_error
-            or not paths.ocr_md.is_file()
-            or not paths.ocr_json.is_file()
+        if (
+            opts.ocr
+            and document.sha256
+            and (
+                opts.force
+                or not document.ocr_written
+                or document.ocr_error
+                or document.ocr_sha256 != document.sha256
+                or document.ocr_config != state.configuration
+                or not paths.ocr_md.is_file()
+                or not paths.ocr_json.is_file()
+            )
         ):
+            document.ocr_pending = True
+            document.ocr_error = None
             ocr_targets.append((custom_id, source))
 
     if not native_targets and not ocr_targets:
-        log.info("nothing to do: every output already exists (use --force to redo)")
+        if not any(doc.ocr_error for doc in state.documents.values()):
+            log.info("nothing to do: every output already exists (use --force to redo)")
         return state
+
+    state.save()
 
     # Local extraction starts first and runs while the uploads are in flight.
     with NativePool(opts.jobs) as pool:
         for custom_id, source, destination in native_targets:
             pool.submit(custom_id, source, destination)
 
-        if ocr_targets:
+        if ocr_targets and opts.provider == "openai":
+            log.info("preparing page requests for %d PDFs", len(ocr_targets))
+            with make_openai_client(api_key) as client:
+                openai_backend.submit(
+                    client, state, ocr_targets, batch_size=opts.batch_size, label=opts.label
+                )
+        elif ocr_targets:
             log.info("uploading %d PDFs", len(ocr_targets))
 
             with make_client(api_key) as client:
@@ -376,6 +446,7 @@ def native_failures(state: RunState) -> int:
 
 
 def _record_jobs(state: RunState, jobs: dict[str, Any]) -> None:
+    known_files = {remote.file_id for remote in state.remote_files}
     for job_id, remote_job in jobs.items():
         job = state.job(job_id)
 
@@ -383,9 +454,23 @@ def _record_jobs(state: RunState, jobs: dict[str, Any]) -> None:
             continue
 
         job.status = str(remote_job.status)
-        job.output_file = getattr(remote_job, "output_file", None)
-        job.error_file = getattr(remote_job, "error_file", None)
-        job.failed_requests = getattr(remote_job, "failed_requests", 0) or 0
+        output_file = getattr(remote_job, "output_file", None)
+        error_file = getattr(remote_job, "error_file", None)
+        failed = getattr(remote_job, "failed_requests", 0) or 0
+        if state.provider == "openai":
+            job.output_file = output_file or job.output_file
+            job.error_file = error_file or job.error_file
+            job.failed_requests = max(failed, job.failed_requests)
+            if not job.terminal:
+                continue
+            for file_id, role in ((job.output_file, "output"), (job.error_file, "error")):
+                if file_id and file_id not in known_files:
+                    state.remote_files.append(RemoteFile(file_id, job_id=job_id, role=role))
+                    known_files.add(file_id)
+        else:
+            job.output_file = output_file
+            job.error_file = error_file
+            job.failed_requests = failed
 
     state.save()
 
@@ -438,6 +523,16 @@ def do_fetch(
     if not state.jobs:
         raise StateError(f"no batch jobs recorded in {output_dir}")
 
+    if state.provider == "openai":
+        return _fetch_openai(
+            state,
+            wait=wait,
+            force=force,
+            keep_remote=keep_remote,
+            cancel_on_interrupt=cancel_on_interrupt,
+            api_key=api_key,
+        )
+
     job_ids = [job.job_id for job in state.jobs if not (job.terminal and job.fetched)]
 
     with make_client(api_key) as client:
@@ -487,7 +582,7 @@ def do_fetch(
                     if not (job.fetched and path.is_file()):
                         download_file(client, job.error_file, path)
                     log.warning("per-request errors written to %s", path)
-                    parts.append(split_results(path, state))
+                    parts.append(split_results(path, state, configuration=job.configuration))
 
                 if not job.output_file:
                     log.error("job %s [%s] produced no output file", job.job_id, job.status)
@@ -495,7 +590,9 @@ def do_fetch(
                     results = state.results_path(job.job_id)
                     if not (job.fetched and results.is_file()):
                         download_file(client, job.output_file, results)
-                    parts.append(split_results(results, state, force=force))
+                    parts.append(
+                        split_results(results, state, force=force, configuration=job.configuration)
+                    )
 
                 for part in parts:
                     summary.written += part.written
@@ -560,7 +657,9 @@ def do_fetch(
         log.error("%d document(s) never reached a batch job; run submit again", unsubmitted)
 
     incomplete = sum(
-        1 for document in state.documents.values() if not document.ocr_written or document.ocr_error
+        1
+        for document in state.documents.values()
+        if not document.ocr_written or document.ocr_error or document.ocr_pending
     )
     problems = (
         incomplete
@@ -579,6 +678,61 @@ def do_fetch(
     return EXIT_OK
 
 
+def _fetch_openai(
+    state: RunState,
+    *,
+    wait: bool,
+    force: bool,
+    keep_remote: bool,
+    cancel_on_interrupt: bool,
+    api_key: str | None,
+) -> int:
+    with make_openai_client(api_key) as client:
+        job_ids = [job.job_id for job in state.active_jobs()]
+
+        def refresh() -> dict[str, Any]:
+            return openai_backend.refresh_jobs(client, [job.job_id for job in state.active_jobs()])
+
+        def on_update(jobs: dict[str, Any], progress: Progress) -> None:
+            _record_jobs(state, jobs)
+            log.info("openai: %s", _describe(jobs, progress))
+
+        try:
+            if job_ids:
+                if wait:
+                    poll_jobs(
+                        refresh, terminal_statuses=OPENAI_TERMINAL_STATUSES, on_update=on_update
+                    )
+                else:
+                    jobs = refresh()
+                    on_update(jobs, aggregate(jobs))
+
+            partial = openai_results.reconcile(client, state, force=force)
+        except KeyboardInterrupt:
+            active = [job.job_id for job in state.active_jobs()]
+            if cancel_on_interrupt and active:
+                log.warning("cancelling %d OpenAI batch job(s)", len(active))
+                openai_backend.cancel_jobs(client, active)
+            log.warning("interrupted; resume with: ocr-batch fetch %s", state.output_dir)
+            return EXIT_INTERRUPTED
+        except BaseException:
+            if not keep_remote:
+                try:
+                    openai_backend.cleanup(client, state)
+                except BaseException as cleanup_exc:
+                    log.warning("cleanup after fetch failure also failed: %s", cleanup_exc)
+            raise
+
+        cleaned = keep_remote or openai_backend.cleanup(client, state)
+
+    if state.active_jobs():
+        log.error("OpenAI batch job(s) still running")
+        return EXIT_ERROR
+    if not cleaned:
+        return EXIT_ERROR
+    return EXIT_PARTIAL if partial or native_failures(state) else EXIT_OK
+
+
 def _describe(jobs: dict[str, Any], progress: Progress) -> str:
     statuses = ", ".join(f"{job_id[:8]}={job.status}" for job_id, job in jobs.items())
 
@@ -592,6 +746,7 @@ def do_status(output_dir: Path, api_key: str | None = None) -> int:
     documents = state.documents.values()
 
     print(f"input:     {state.input_dir}")
+    print(f"provider:  {state.provider or 'local only'}")
     print(f"model:     {state.model}")
     print(f"created:   {state.created_at}")
     print(f"documents: {len(state.documents)}")
@@ -603,22 +758,28 @@ def do_status(output_dir: Path, api_key: str | None = None) -> int:
         f"  ocr:     {sum(1 for d in documents if d.ocr_written)} written, "
         f"{sum(1 for d in documents if d.ocr_error)} failed"
     )
-    print(f"uploads:   {len(state.pending_remote_files())} still on Mistral")
+    print(f"remote files: {len(state.pending_remote_files())} pending cleanup")
 
     if not state.jobs:
         print("jobs:      none")
         return EXIT_OK
 
-    with make_client(api_key) as client:
-        jobs = refresh_jobs(client, [job.job_id for job in state.jobs])
-        _record_jobs(state, jobs)
+    job_ids = [job.job_id for job in state.jobs]
+    jobs: dict[str, Any]
+    if state.provider == "openai":
+        with make_openai_client(api_key) as client:
+            jobs = openai_backend.refresh_jobs(client, job_ids)
+    else:
+        with make_client(api_key) as client:
+            jobs = refresh_jobs(client, job_ids)
 
-        for job_id, remote_job in jobs.items():
-            print(
-                f"job {job_id}: {remote_job.status} "
-                f"{remote_job.succeeded_requests}/{remote_job.total_requests} succeeded, "
-                f"{remote_job.failed_requests} failed"
-            )
+    _record_jobs(state, jobs)
+    for job_id, remote_job in jobs.items():
+        print(
+            f"job {job_id}: {remote_job.status} "
+            f"{remote_job.succeeded_requests}/{remote_job.total_requests} succeeded, "
+            f"{remote_job.failed_requests} failed"
+        )
 
     return EXIT_OK
 
@@ -626,6 +787,17 @@ def do_status(output_dir: Path, api_key: str | None = None) -> int:
 def do_cleanup(output_dir: Path, *, force: bool = False, api_key: str | None = None) -> int:
     output_dir = output_dir.resolve()
     state = RunState.load(output_dir)
+
+    if state.provider == "openai":
+        active = [job.job_id for job in state.active_jobs()]
+        if not active and not state.pending_remote_files():
+            log.info("no OpenAI files left to delete")
+            return EXIT_OK
+        with make_openai_client(api_key) as client:
+            if active:
+                _record_jobs(state, openai_backend.refresh_jobs(client, active))
+            cleaned = openai_backend.cleanup(client, state)
+        return EXIT_OK if cleaned else EXIT_ERROR
 
     if not state.pending_remote_files():
         log.info("no uploaded files left to delete")
@@ -640,15 +812,16 @@ def do_cleanup(output_dir: Path, *, force: bool = False, api_key: str | None = N
     return EXIT_OK if cleaned else EXIT_ERROR
 
 
-def _submit_exit_code(state: RunState) -> int:
-    """Exit code for a run that produced no batch job (e.g. --no-ocr)."""
+def _submit_exit_code(state: RunState, *, ocr: bool) -> int:
     failed = native_failures(state)
 
     if failed:
         log.error("%d document(s) failed local extraction", failed)
         return EXIT_PARTIAL
 
-    return EXIT_OK
+    return (
+        EXIT_PARTIAL if ocr and any(doc.ocr_error for doc in state.documents.values()) else EXIT_OK
+    )
 
 
 def do_run(
@@ -663,7 +836,7 @@ def do_run(
     state = do_submit(input_dir, output_dir, opts, api_key=api_key)
 
     if not state.jobs:
-        return _submit_exit_code(state)
+        return _submit_exit_code(state, ocr=opts.ocr)
 
     return do_fetch(
         output_dir,
@@ -681,7 +854,7 @@ def do_run(
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--api-key", help="Mistral API key (default: $MISTRAL_API_KEY)")
+    parser.add_argument("--api-key", help="override $MISTRAL_API_KEY or $OPENAI_API_KEY")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     parser.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
 
@@ -689,12 +862,17 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def _add_submit_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="OCR model (default: %(default)s)")
+    parser.add_argument(
+        "--provider", default="mistral", choices=("mistral", "openai"), help="OCR backend"
+    )
+    parser.add_argument(
+        "--model", help=f"model (defaults: {DEFAULT_MODEL} or {openai_backend.DEFAULT_MODEL})"
+    )
     parser.add_argument(
         "--no-native", dest="native", action="store_false", help="skip local PyMuPDF extraction"
     )
     parser.add_argument(
-        "--no-ocr", dest="ocr", action="store_false", help="skip the Mistral batch OCR entirely"
+        "--no-ocr", dest="ocr", action="store_false", help="skip remote batch OCR entirely"
     )
     parser.add_argument(
         "--force",
@@ -707,56 +885,57 @@ def _add_submit_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--upload-workers",
         type=int,
-        default=DEFAULT_UPLOAD_WORKERS,
-        help="concurrent uploads (default: %(default)s)",
+        help=f"concurrent uploads, Mistral only (default: {DEFAULT_UPLOAD_WORKERS})",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help="requests per batch job (default: %(default)s)",
+        help="maximum requests per batch, documents for Mistral or pages for OpenAI "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--timeout-hours",
         type=int,
         default=DEFAULT_TIMEOUT_HOURS,
-        help="batch job timeout (default: %(default)s)",
+        help="batch job timeout (default: %(default)s, only supported value for OpenAI)",
     )
     parser.add_argument(
         "--url-expiry-hours",
         type=int,
-        default=DEFAULT_URL_EXPIRY_HOURS,
-        help="signed URL lifetime, max 168 (default: %(default)s)",
+        help=f"signed URL lifetime, Mistral only (default and maximum: {DEFAULT_URL_EXPIRY_HOURS})",
     )
     parser.add_argument(
         "--upload-expiry-hours",
         type=int,
         default=None,
-        help="server-side expiry of uploads (default: timeout + 24h)",
+        help="server-side expiry of uploads, Mistral only (default: timeout + 24h)",
     )
     parser.add_argument("--label", default="ocr-batch", help="job metadata purpose label")
     parser.add_argument(
         "--no-include-blocks",
         dest="include_blocks",
         action="store_false",
-        help="omit per-block bounding boxes from the OCR response",
+        default=None,
+        help="omit per-block bounding boxes, Mistral only",
     )
     parser.add_argument(
         "--confidence-granularity",
-        default="block",
         choices=("none", "page", "word", "block"),
-        help="confidence score granularity (default: %(default)s)",
+        help="confidence score granularity, Mistral only (default: block)",
     )
-    parser.add_argument("--table-format", default="markdown", choices=("markdown", "html"))
     parser.add_argument(
-        "--keep-remote", action="store_true", help="do not delete the uploaded originals afterwards"
+        "--table-format", choices=("markdown", "html"), help="Mistral only (default: markdown)"
+    )
+    parser.add_argument(
+        "--keep-remote", action="store_true", help="keep remote files after fetching"
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ocr-batch",
-        description="Batch OCR a tree of PDFs with PyMuPDF and the Mistral batch API.",
+        description="Batch OCR a tree of PDFs with PyMuPDF, Mistral, or OpenAI.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -789,7 +968,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fetch.add_argument("--force", action="store_true", help="rewrite outputs that already exist")
     fetch.add_argument(
-        "--keep-remote", action="store_true", help="do not delete the uploaded originals afterwards"
+        "--keep-remote", action="store_true", help="keep remote files after fetching"
     )
     fetch.add_argument(
         "--cancel-on-interrupt",
@@ -798,10 +977,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(fetch)
 
-    cleanup = subparsers.add_parser("cleanup", help="delete uploaded originals from Mistral")
+    cleanup = subparsers.add_parser("cleanup", help="delete eligible remote files")
     cleanup.add_argument("output_dir", type=Path)
     cleanup.add_argument(
-        "--force", action="store_true", help="delete even while a job is still running"
+        "--force", action="store_true", help="delete Mistral uploads even while a job is running"
     )
     _add_common(cleanup)
 
@@ -809,24 +988,41 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _submit_options(args: argparse.Namespace) -> SubmitOptions:
-    granularity = None if args.confidence_granularity == "none" else args.confidence_granularity
+    if args.provider == "openai":
+        for name, value in (
+            ("upload-workers", args.upload_workers),
+            ("url-expiry-hours", args.url_expiry_hours),
+            ("upload-expiry-hours", args.upload_expiry_hours),
+            ("no-include-blocks", args.include_blocks),
+            ("confidence-granularity", args.confidence_granularity),
+            ("table-format", args.table_format),
+        ):
+            if value is not None:
+                raise ConfigError(f"--{name} is only supported by Mistral")
+
+    granularity = args.confidence_granularity or "block"
 
     return SubmitOptions(
+        provider=args.provider,
         model=args.model,
         native=args.native,
         ocr=args.ocr,
         force=args.force,
         jobs=args.jobs,
-        upload_workers=args.upload_workers,
+        upload_workers=(
+            DEFAULT_UPLOAD_WORKERS if args.upload_workers is None else args.upload_workers
+        ),
         batch_size=args.batch_size,
         timeout_hours=args.timeout_hours,
-        url_expiry_hours=args.url_expiry_hours,
+        url_expiry_hours=(
+            DEFAULT_URL_EXPIRY_HOURS if args.url_expiry_hours is None else args.url_expiry_hours
+        ),
         upload_expiry_hours=args.upload_expiry_hours,
         label=args.label,
         ocr_options=OcrOptions(
-            include_blocks=args.include_blocks,
-            confidence_granularity=granularity,
-            table_format=args.table_format,
+            include_blocks=args.include_blocks is not False,
+            confidence_granularity=None if granularity == "none" else granularity,
+            table_format=args.table_format or "markdown",
         ),
     )
 
@@ -865,7 +1061,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.output_dir,
                         _submit_options(args),
                         api_key=args.api_key,
-                    )
+                    ),
+                    ocr=args.ocr,
                 )
             case "status":
                 return do_status(args.output_dir, api_key=args.api_key)
