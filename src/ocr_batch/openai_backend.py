@@ -123,8 +123,12 @@ def _request_line(custom_id: str, png: bytes, config: dict[str, Any]) -> bytes:
 
 def _stage_document(
     spool: IO[bytes], path: Path, document: DocumentState, config: dict[str, Any]
-) -> None:
-    """Validate one document before including any of its pages in an upload."""
+) -> list[tuple[str, PageRequest]]:
+    """Validate one document before including any of its pages in an upload.
+
+    Returns the request ID and page of each line written to `spool`, in order.
+    """
+    staged: list[tuple[str, PageRequest]] = []
     with pymupdf.open(path) as pdf:
         if not pdf.is_pdf or pdf.is_repaired:
             raise ValueError("not an intact PDF")
@@ -156,6 +160,8 @@ def _stage_document(
             except Exception as exc:
                 raise ValueError(f"page {index + 1}: {exc}") from exc
             spool.write(line)
+            staged.append((request_id, PageRequest(document.custom_id, index)))
+    return staged
 
 
 @contextmanager
@@ -169,7 +175,13 @@ def _record_before_interrupt() -> Iterator[None]:
 
     def defer(_signum: int, _frame: Any) -> None:
         nonlocal interrupted
+        if interrupted:
+            raise KeyboardInterrupt
         interrupted = True
+        log.warning(
+            "stopping once the current request finishes; press Ctrl-C again to stop now "
+            "(the remote ID may then go unrecorded)"
+        )
 
     previous = signal.signal(signal.SIGINT, defer)
     try:
@@ -210,7 +222,8 @@ def _submit_part(
         remote.awaiting_batch_until = time.time() + INPUT_EXPIRY_SECONDS
         state.save()
         try:
-            batch = client.batches.create(
+            # An ambiguous failure must not trigger a second paid POST.
+            batch = client.with_options(max_retries=0).batches.create(
                 input_file_id=remote.file_id,
                 endpoint=ENDPOINT,
                 completion_window="24h",
@@ -224,6 +237,10 @@ def _submit_part(
                 and exc.status_code != 408
             ):
                 remote.awaiting_batch_until = None
+                try:
+                    remote.deleted = client.files.delete(remote.file_id).deleted
+                except Exception as delete_exc:
+                    log.warning("could not delete %s: %s", remote.file_id, delete_exc)
                 state.save()
             raise RemoteError(f"could not create OpenAI batch for {remote.file_id}: {exc}") from exc
 
@@ -233,7 +250,6 @@ def _submit_part(
         state.jobs.append(
             JobState(
                 job_id=batch.id,
-                custom_ids=list(requests),
                 status="validating",
                 requests=requests.copy(),
                 configuration=state.configuration,
@@ -263,14 +279,14 @@ def submit(
             document = state.documents[document_id]
             with tempfile.TemporaryFile(mode="w+b") as source:
                 try:
-                    _stage_document(source, path, document, config)
+                    staged = _stage_document(source, path, document, config)
                 except (RuntimeError, ValueError) as exc:
                     document.ocr_error = str(exc)
                     log.error("cannot prepare %s: %s", path, exc)
                     continue
 
                 source.seek(0)
-                for index, line in enumerate(source):
+                for (request_id, request), line in zip(staged, source, strict=True):
                     if requests and (
                         len(requests) >= count_limit or batch.tell() + len(line) > MAX_BATCH_BYTES
                     ):
@@ -280,7 +296,7 @@ def submit(
                         requests.clear()
 
                     batch.write(line)
-                    requests[f"{document_id}-{index + 1}"] = PageRequest(document_id, index)
+                    requests[request_id] = request
 
         if requests:
             _submit_part(client, state, batch, requests, label)
@@ -360,7 +376,6 @@ def cleanup(client: OpenAI, state: RunState) -> bool:
         job = state.job(remote.job_id) if remote.job_id else None
         if remote.awaiting_batch_until and remote.awaiting_batch_until > time.time():
             log.warning("keeping %s because OpenAI batch creation is unconfirmed", remote.file_id)
-            ok = False
             continue
         if job is not None and not job.terminal:
             log.warning(
@@ -368,15 +383,16 @@ def cleanup(client: OpenAI, state: RunState) -> bool:
             )
             ok = False
             continue
-        if remote.role != "input":
-            assert remote.job_id is not None
+        # Results of a job discarded by `submit --force` will never be downloaded.
+        if remote.role != "input" and job is not None:
             local = (
-                state.results_path(remote.job_id)
+                state.results_path(job.job_id)
                 if remote.role == "output"
-                else state.errors_path(remote.job_id)
+                else state.errors_path(job.job_id)
             )
             if not local.is_file():
-                log.info("keeping %s until downloaded to %s", remote.file_id, local)
+                log.warning("keeping %s until downloaded to %s", remote.file_id, local)
+                ok = False
                 continue
             # An earlier process may have stopped just after publishing the rename.
             sync_directory(local.parent)

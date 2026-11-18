@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, BinaryIO
 
+import httpx
+import openai
 import pymupdf
 import pytest
 from conftest import write_pdf
@@ -135,6 +137,7 @@ class FakeOpenAI:
     cancelled: list[str] = field(default_factory=list)
     keys: list[str | None] = field(default_factory=list)
     fail_delete: set[str] = field(default_factory=set)
+    options: list[dict[str, Any]] = field(default_factory=list)
     interrupt: str | None = None
     files: FakeFiles = field(init=False)
     batches: FakeBatches = field(init=False)
@@ -142,6 +145,10 @@ class FakeOpenAI:
     def __post_init__(self) -> None:
         self.files = FakeFiles(self)
         self.batches = FakeBatches(self)
+
+    def with_options(self, **options: Any) -> FakeOpenAI:
+        self.options.append(options)
+        return self
 
     def submit(self, *args: str) -> int:
         return cli.main(
@@ -567,8 +574,17 @@ def test_ambiguous_batch_creation_keeps_the_input(
     state = RunState.load(client.out)
     assert not state.jobs
     assert state.pending_remote_files()[0].file_id == "input-1"
-    assert client.resume("cleanup") == cli.EXIT_ERROR
+    assert client.resume("cleanup") == cli.EXIT_OK
     assert not client.deleted
+
+    # The retained input does not make a later successful run fail.
+    monkeypatch.setattr(client.batches, "create", create)
+    client.jobs["batch-1"].status = "completed"
+    assert client.submit() == cli.EXIT_OK
+    (page,) = client.ids("batch-2")
+    client.finish("batch-2", [response_row(page)])
+    assert client.resume("fetch") == cli.EXIT_OK
+    assert "input-1" not in client.deleted
 
 
 def test_failed_replacement_retains_openai_output_and_its_provenance(openai_client: FakeOpenAI):
@@ -615,7 +631,7 @@ def test_cleanup_never_deletes_unfetched_results(openai_client: FakeOpenAI):
     payload = client.payloads.pop(file_id)
     assert client.resume("fetch") == cli.EXIT_ERROR
     assert file_id not in client.deleted
-    client.resume("cleanup", "--force")
+    assert client.resume("cleanup", "--force") == cli.EXIT_ERROR
     assert client.deleted == ["input-1"]
 
     client.payloads[file_id] = payload
@@ -674,3 +690,55 @@ def test_cancellation_in_progress_protects_inputs_and_cancelled_jobs_keep_output
     assert not client.deleted
     assert client.resume("cleanup") == cli.EXIT_OK
     assert set(client.deleted) == {"input-1", "output-batch-1"}
+
+
+def test_only_batch_creation_disables_sdk_retries(openai_client: FakeOpenAI):
+    client = openai_client
+    write_pdf(client.root / "a.pdf", "Synthetic")
+    assert client.submit() == cli.EXIT_OK
+    assert client.options == [{"max_retries": 0}]
+    assert not RunState.load(client.out).jobs[0].custom_ids
+
+
+def test_openai_client_keeps_default_retries(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai")
+    with cli.make_openai_client() as client:
+        assert client.max_retries > 0
+
+
+def test_rejected_batch_creation_deletes_the_input(
+    openai_client: FakeOpenAI, monkeypatch: pytest.MonkeyPatch
+):
+    client = openai_client
+    write_pdf(client.root / "a.pdf", "Synthetic")
+
+    def reject(**kwargs: Any) -> FakeBatch:
+        request = httpx.Request("POST", "https://api.openai.com/v1/batches")
+        response = httpx.Response(400, request=request)
+        raise openai.BadRequestError("invalid model", response=response, body=None)
+
+    monkeypatch.setattr(client.batches, "create", reject)
+    assert client.submit() == cli.EXIT_ERROR
+    assert client.deleted == ["input-1"]
+    assert not RunState.load(client.out).pending_remote_files()
+
+
+def test_cleanup_deletes_results_of_discarded_jobs(openai_client: FakeOpenAI):
+    client = openai_client
+    write_pdf(client.root / "a.pdf", "Synthetic")
+    assert client.submit() == cli.EXIT_OK
+    (page,) = client.ids("batch-1")
+    client.finish("batch-1", [response_row(page)])
+    assert client.resume("status") == cli.EXIT_OK
+    assert client.submit("--force") == cli.EXIT_OK
+
+    # batch-2 is still running, so its input is kept.
+    assert client.resume("cleanup") == cli.EXIT_ERROR
+    assert set(client.deleted) == {"input-1", "output-batch-1"}
+
+
+def test_second_interrupt_is_not_deferred():
+    with pytest.raises(KeyboardInterrupt), openai_backend._record_before_interrupt():
+        signal.raise_signal(signal.SIGINT)
+        signal.raise_signal(signal.SIGINT)
+        pytest.fail("the second interrupt was deferred")

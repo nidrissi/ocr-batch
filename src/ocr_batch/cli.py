@@ -143,8 +143,7 @@ def make_client(api_key: str | None = None) -> Iterator[MistralClient]:
 
 @contextmanager
 def make_openai_client(api_key: str | None = None) -> Iterator[OpenAI]:
-    # An ambiguous failure on batch creation must not trigger a second paid POST.
-    with OpenAI(api_key=resolve_api_key(api_key, "openai"), max_retries=0, timeout=120) as client:
+    with OpenAI(api_key=resolve_api_key(api_key, "openai"), timeout=120) as client:
         yield client
 
 
@@ -428,7 +427,9 @@ def do_submit(
     state.write_manifest()
 
     for job in state.jobs:
-        log.info("batch job %s submitted (%d requests)", job.job_id, len(job.custom_ids))
+        log.info(
+            "batch job %s submitted (%d requests)", job.job_id, len(job.requests or job.custom_ids)
+        )
 
     if state.jobs:
         log.info("resume with: ocr-batch fetch %s", output_dir)

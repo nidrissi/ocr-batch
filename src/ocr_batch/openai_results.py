@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from openai import OpenAI
 
@@ -90,10 +90,11 @@ class PageResult:
     fingerprint: bytes
     error: str | None
 
-    def read(self, index: int) -> dict[str, Any]:
-        with self.path.open("rb") as handle:
-            handle.seek(self.offset)
-            row = json.loads(handle.readline())
+    def read(self, index: int, handles: dict[Path, IO[bytes]]) -> dict[str, Any]:
+        if (handle := handles.get(self.path)) is None:
+            handle = handles[self.path] = self.path.open("rb")
+        handle.seek(self.offset)
+        row = json.loads(handle.readline())
         body, markdown, blank = _page_payload(row)
         return {
             "index": index,
@@ -215,7 +216,12 @@ def reconcile(client: OpenAI, state: RunState, *, force: bool) -> bool:
         ):
             continue
 
-        assembled = [results[index].read(index) for index in range(count)]
+        handles: dict[Path, IO[bytes]] = {}
+        try:
+            assembled = [results[index].read(index, handles) for index in range(count)]
+        finally:
+            for handle in handles.values():
+                handle.close()
         data = {
             "provider": "openai",
             "document_id": document_id,
@@ -233,7 +239,6 @@ def reconcile(client: OpenAI, state: RunState, *, force: bool) -> bool:
             }
         )
         document.complete_ocr(configuration)
-        state.save()
 
     state.save()
     state.write_manifest()
