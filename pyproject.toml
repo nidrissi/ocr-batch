@@ -1,6 +1,6 @@
 [project]
 name = "ocr-batch"
-version = "0.1.0b3"
+version = "0.2.0"
 description = "Batch OCR PDFs using PyMuPDF, Mistral, and OpenAI."
 readme = "README.md"
 authors = [
