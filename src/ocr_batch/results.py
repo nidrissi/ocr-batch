@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import output_paths
-from .state import RunState
+from .state import RunState, write_atomic_outputs
 from .text import join_pages, page_chunk
 
 log = logging.getLogger(__name__)
@@ -74,6 +74,7 @@ def split_results(
     state: RunState,
     *,
     force: bool = False,
+    configuration: dict[str, Any] | None = None,
 ) -> SplitSummary:
     """Write `.ocr.json` and `.ocr.md` for every row, recording failures in state.
 
@@ -158,15 +159,13 @@ def split_results(
                 summary.malformed += 1
                 continue
 
-            paths.ocr_md.parent.mkdir(parents=True, exist_ok=True)
-            paths.ocr_json.write_text(
-                json.dumps(body, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
+            write_atomic_outputs(
+                {
+                    paths.ocr_json: json.dumps(body, indent=2, ensure_ascii=False) + "\n",
+                    paths.ocr_md: markdown,
+                }
             )
-            paths.ocr_md.write_text(markdown, encoding="utf-8")
-
-            document.ocr_written = True
-            document.ocr_error = None
+            document.complete_ocr(configuration)
             summary.written += 1
 
     return summary

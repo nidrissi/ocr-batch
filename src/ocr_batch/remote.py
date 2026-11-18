@@ -344,11 +344,26 @@ def wait_for_jobs(
     Backs off from 5s to 5min and only reports when something actually changed,
     so a 24h job costs a few dozen requests and a few dozen log lines.
     """
+    return poll_jobs(
+        lambda: refresh_jobs(client, job_ids),
+        terminal_statuses=TERMINAL_STATUSES,
+        on_update=on_update,
+        sleep=sleep,
+    )
+
+
+def poll_jobs(
+    refresh: Callable[[], dict[str, Any]],
+    *,
+    terminal_statuses: frozenset[str],
+    on_update: Callable[[dict[str, Any], Progress], None],
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
     delay = POLL_INITIAL_SECONDS
     previous: tuple[Any, ...] | None = None
 
     while True:
-        jobs = refresh_jobs(client, job_ids)
+        jobs = refresh()
         progress = aggregate(jobs)
         snapshot = (progress, tuple(sorted(job.status for job in jobs.values())))
 
@@ -357,7 +372,7 @@ def wait_for_jobs(
             previous = snapshot
             delay = POLL_INITIAL_SECONDS
 
-        if all(job.status in TERMINAL_STATUSES for job in jobs.values()):
+        if all(job.status in terminal_statuses for job in jobs.values()):
             return jobs
 
         sleep(delay)
